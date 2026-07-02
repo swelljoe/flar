@@ -14,6 +14,7 @@ It is a simple, lightweight CLI tool in Go to run coding agent CLIs (like Claude
   - **Host Mode**: Option to share the host's network namespace for unconstrained access.
 - **Dangerous Bypass Options**: Automatically injects flags (like `--dangerously-skip-permissions` for Claude/`agy` or `--dangerously-bypass-approvals-and-sandbox` for Codex) so agents run without runtime approval interruptions. Can be disabled with `-ask`.
 - **Config Copying**: Automatically copies host credentials (like `~/.claude/`, `~/.codex/`, `~/.gemini/`, or GitHub CLI configurations) to a temporary directory mounted inside the sandbox home directory, leaving host config files untouched.
+- **Keyring Bridging (`agy`)**: The Antigravity CLI stores its OAuth token in the OS keyring rather than a file. flar extracts only that one secret and serves it inside the sandbox through a private, in-process Secret Service — so the agent authenticates without exposing the rest of your keyring. See [Credentials](#credentials).
 
 ## Build and Install
 
@@ -71,6 +72,29 @@ You can configure options per-project in `<project>/.flar.json` or globally in `
   "allow_ports": [5432, 11434]
 }
 ```
+
+## Credentials
+
+Because only a temporary copy of your config is mounted, agents run authenticated using your existing host session without touching the originals. Most agents keep their session in files that flar copies directly:
+
+* **Claude**: `~/.claude/` (including `.credentials.json`) **and** `~/.claude.json`, the top-level file holding onboarding state and account identity. Both are required; with only the credentials, Claude treats the sandbox as a fresh install and prompts for login.
+* **Codex / Copilot**: `~/.codex/`, `~/.copilot/`, and the GitHub CLI config.
+
+### Antigravity (`agy`) keyring
+
+`agy` is the exception: it does **not** store its token in a file. It keeps it in the OS keyring, read via the freedesktop Secret Service API over the D-Bus session bus. The sandbox has no session bus, so a naïve setup fails with `authentication failed or timed out`.
+
+flar handles this specially:
+
+1. On the host, it extracts **only** the `agy` token (keyring item `service=gemini, username=antigravity`) using `secret-tool`, and writes it to a `0600` file in the temporary config directory.
+2. Inside the sandbox, it runs a minimal, self-contained Secret Service (`flar --internal-secretsvc`) on a private Unix socket, pointed to by `DBUS_SESSION_BUS_ADDRESS`. It serves that single token and nothing else.
+
+The agent can reach exactly its own token — not the rest of your keyring (browser passwords, other apps' secrets, etc.). The implementation speaks the D-Bus wire protocol directly, so it needs **no** `gnome-keyring` or `dbus-daemon` inside the sandbox.
+
+Requirements and caveats:
+
+* Host-side extraction needs `secret-tool` (libsecret) installed on the host. If it is absent or the token is not found, flar skips the bridge and `agy` falls back to its normal login prompt.
+* Any authenticated agent can, by definition, read its own token; a prompt-injection attack could exfiltrate it. This is inherent to running authenticated at all. The keyring bridge limits the exposure to that one token rather than your entire keyring.
 
 ## Network Security & Local Ports
 

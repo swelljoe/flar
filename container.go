@@ -119,6 +119,10 @@ func RunSandbox(opts RunOpts) error {
 	// Bind-mount project directory (read-write)
 	bwrapArgs = append(bwrapArgs, "--bind", absProjectDir, absProjectDir)
 
+	// Path to agy's keyring token inside the sandbox, if extracted. When set,
+	// flar runs a private Secret Service serving only this token.
+	var agySecretInSandbox string
+
 	// Setup HOME directory structure inside sandbox
 	bwrapArgs = append(bwrapArgs, "--dir", hostHome)
 
@@ -130,6 +134,10 @@ func RunSandbox(opts RunOpts) error {
 			if _, err := os.Stat(claudePath); err == nil {
 				bwrapArgs = append(bwrapArgs, "--bind", claudePath, filepath.Join(hostHome, ".claude"))
 			}
+			claudeJSONPath := filepath.Join(opts.TempConfig, ".claude.json")
+			if _, err := os.Stat(claudeJSONPath); err == nil {
+				bwrapArgs = append(bwrapArgs, "--bind", claudeJSONPath, filepath.Join(hostHome, ".claude.json"))
+			}
 		case AgentCodex:
 			codexPath := filepath.Join(opts.TempConfig, ".codex")
 			if _, err := os.Stat(codexPath); err == nil {
@@ -139,6 +147,11 @@ func RunSandbox(opts RunOpts) error {
 			agyPath := filepath.Join(opts.TempConfig, ".gemini")
 			if _, err := os.Stat(agyPath); err == nil {
 				bwrapArgs = append(bwrapArgs, "--bind", agyPath, filepath.Join(hostHome, ".gemini"))
+			}
+			secretPath := filepath.Join(opts.TempConfig, agySecretFile)
+			if _, err := os.Stat(secretPath); err == nil {
+				agySecretInSandbox = filepath.Join(hostHome, "."+agySecretFile)
+				bwrapArgs = append(bwrapArgs, "--ro-bind", secretPath, agySecretInSandbox)
 			}
 		case AgentCopilot:
 			copilotPath := filepath.Join(opts.TempConfig, ".copilot")
@@ -159,17 +172,34 @@ func RunSandbox(opts RunOpts) error {
 		}
 	}
 
-	// Mount the host flar binary inside the sandbox
+	// Mount the host flar binary inside the sandbox at its exact absolute path
 	hostFlar, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("failed to get flar executable path: %w", err)
 	}
-	realHostFlar, err := filepath.EvalSymlinks(hostFlar)
+	absHostFlar, err := filepath.Abs(hostFlar)
 	if err != nil {
-		realHostFlar = hostFlar
+		absHostFlar = hostFlar
 	}
-	bwrapArgs = append(bwrapArgs, "--dir", "/usr/local/bin")
-	bwrapArgs = append(bwrapArgs, "--ro-bind", realHostFlar, "/usr/local/bin/flar")
+	realHostFlar, err := filepath.EvalSymlinks(absHostFlar)
+	if err != nil {
+		realHostFlar = absHostFlar
+	}
+
+	flarDir := filepath.Dir(absHostFlar)
+	var flarDirs []string
+	currFlar := "/"
+	for _, part := range strings.Split(flarDir, "/") {
+		if part == "" {
+			continue
+		}
+		currFlar = filepath.Join(currFlar, part)
+		flarDirs = append(flarDirs, currFlar)
+	}
+	for _, d := range flarDirs {
+		bwrapArgs = append(bwrapArgs, "--dir", d)
+	}
+	bwrapArgs = append(bwrapArgs, "--ro-bind", realHostFlar, absHostFlar)
 
 	// Mount agent binary if it's in the home directory or not under /usr /bin /sbin
 	if !strings.HasPrefix(realAgentPath, "/usr/") && !strings.HasPrefix(realAgentPath, "/bin/") && !strings.HasPrefix(realAgentPath, "/sbin/") {
@@ -194,11 +224,15 @@ func RunSandbox(opts RunOpts) error {
 		bwrapArgs = append(bwrapArgs, "--bind", opts.TempNetDir, "/run/flar-net")
 	}
 
+
 	// Pass environment variables
 	bwrapArgs = append(bwrapArgs, "--setenv", "HOME", hostHome)
 	envVars := []string{
 		"PATH",
 		"TERM",
+		"USER",
+		"USERNAME",
+		"LOGNAME",
 		"ANTHROPIC_API_KEY",
 		"OPENAI_API_KEY",
 		"GEMINI_API_KEY",
@@ -210,6 +244,15 @@ func RunSandbox(opts RunOpts) error {
 		if val, exists := os.LookupEnv(env); exists {
 			bwrapArgs = append(bwrapArgs, "--setenv", env, val)
 		}
+	}
+
+	// Point agy at the private Secret Service and tell the internal service
+	// where to read the token from.
+	if agySecretInSandbox != "" {
+		bwrapArgs = append(bwrapArgs,
+			"--setenv", "DBUS_SESSION_BUS_ADDRESS", "unix:path="+agyBusSocket,
+			"--setenv", "FLAR_AGY_SECRET_FILE", agySecretInSandbox,
+		)
 	}
 
 	// Setup proxies if isolated network
@@ -251,12 +294,21 @@ func RunSandbox(opts RunOpts) error {
 	// Prepare script inside sandbox
 	var bashScript strings.Builder
 	if opts.Network == "isolated" {
-		// Run HTTP/HTTPS proxy inside sandbox
-		bashScript.WriteString("flar --internal-proxy 9090 /run/flar-net/http-proxy.sock &\n")
+		// Run HTTP/HTTPS proxy inside sandbox using the absolute flar path
+		bashScript.WriteString(fmt.Sprintf("%s --internal-proxy 9090 /run/flar-net/http-proxy.sock &\n", absHostFlar))
 		// Run custom TCP proxies
 		for _, port := range opts.AllowPorts {
-			bashScript.WriteString(fmt.Sprintf("flar --internal-proxy %d /run/flar-net/port-%d.sock &\n", port, port))
+			bashScript.WriteString(fmt.Sprintf("%s --internal-proxy %d /run/flar-net/port-%d.sock &\n", absHostFlar, port, port))
 		}
+		// Wait for the proxies to bind and start listening
+		bashScript.WriteString("sleep 0.2\n")
+	}
+
+	// Launch the private Secret Service so agy can read its token from a socket
+	// instead of the (absent) host keyring.
+	if agySecretInSandbox != "" {
+		bashScript.WriteString(fmt.Sprintf("%s --internal-secretsvc %s &\n", absHostFlar, agyBusSocket))
+		bashScript.WriteString(fmt.Sprintf("for i in $(seq 1 50); do [ -S %s ] && break; sleep 0.02; done\n", agyBusSocket))
 	}
 
 	bashScript.WriteString("exec \"$@\"\n")

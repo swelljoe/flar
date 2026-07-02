@@ -41,6 +41,16 @@ func PrepareConfigDir(agent Agent) (string, error) {
 				return "", err
 			}
 		}
+		// ~/.claude.json holds onboarding state and the OAuth account; without it
+		// Claude treats the sandbox as a fresh install and forces re-login.
+		srcClaudeJSON := filepath.Join(home, ".claude.json")
+		if _, err := os.Stat(srcClaudeJSON); err == nil {
+			destClaudeJSON := filepath.Join(tempDir, ".claude.json")
+			if err := CopyFile(srcClaudeJSON, destClaudeJSON); err != nil {
+				os.RemoveAll(tempDir)
+				return "", err
+			}
+		}
 
 	case AgentCodex:
 		srcCodex := filepath.Join(home, ".codex")
@@ -60,6 +70,13 @@ func PrepareConfigDir(agent Agent) (string, error) {
 				os.RemoveAll(tempDir)
 				return "", err
 			}
+		}
+		// agy keeps its OAuth token in the OS keyring (Secret Service), not a
+		// file. Extract just that one secret so the sandbox can serve it via a
+		// private Secret Service without exposing the whole keyring.
+		if token, err := extractAgyToken(); err == nil && token != "" {
+			dest := filepath.Join(tempDir, agySecretFile)
+			_ = os.WriteFile(dest, []byte(token), 0o600)
 		}
 
 	case AgentCopilot:

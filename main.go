@@ -32,6 +32,23 @@ func (i *intSlice) Set(value string) error {
 }
 
 func main() {
+	// Internal Secret Service execution inside the sandbox. The secret is passed
+	// via env (FLAR_AGY_SECRET), not argv, to keep it off the process list.
+	if len(os.Args) >= 3 && os.Args[1] == "--internal-secretsvc" {
+		socketPath := os.Args[2]
+		secret := os.Getenv("FLAR_AGY_SECRET")
+		if f := os.Getenv("FLAR_AGY_SECRET_FILE"); f != "" {
+			if b, err := os.ReadFile(f); err == nil {
+				secret = string(b)
+			}
+		}
+		if err := RunSecretService(socketPath, secret); err != nil {
+			fmt.Fprintf(os.Stderr, "secretsvc error: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	// Check if this is an internal proxy execution inside the sandbox
 	if len(os.Args) >= 4 && os.Args[1] == "--internal-proxy" {
 		portStr := os.Args[2]
