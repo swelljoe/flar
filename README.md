@@ -10,7 +10,7 @@ It is a simple, lightweight CLI tool in Go to run coding agent CLIs (like Claude
 - **Strict Filesystem Isolation**: Only the target project directory is bind-mounted read-write. The rest of the host home directory is hidden, protecting ssh keys, shell configurations, and personal files from prompt injection attacks.
 - **Network Sandboxing**: 
   - **Isolated Mode (Default)**: The network namespace is unshared. Internet access is tunneled through a host-side HTTP/HTTPS proxy that performs DNS lookup on the host and filters out traffic to local/loopback IP addresses.
-  - **Port Forwarding**: Selectively expose local services (e.g. databases, Ollama models) into the sandbox by mapping specific ports to the host's `localhost`.
+  - **Port Forwarding**: Selectively expose local services (e.g. databases, llama.cpp models) into the sandbox by mapping specific ports to the host's `localhost`.
   - **Host Mode**: Option to share the host's network namespace for unconstrained access.
 - **Dangerous Bypass Options**: Automatically injects flags (like `--dangerously-skip-permissions` for Claude/`agy` or `--dangerously-bypass-approvals-and-sandbox` for Codex) so agents run without runtime approval interruptions. Can be disabled with `-ask`.
 - **Config Copying**: Automatically copies host credentials (like `~/.claude/`, `~/.codex/`, `~/.gemini/`, or GitHub CLI configurations) to a temporary directory mounted inside the sandbox home directory, leaving host config files untouched.
