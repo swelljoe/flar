@@ -4,6 +4,8 @@ FLAR is the Fast Light Agent Restrictor. It runs on rocks called gars.
 
 It is a simple, lightweight CLI tool in Go to run coding agent CLIs (like Claude Code, Antigravity, Codex, and Copilot) safely inside isolated Bubblewrap (`bwrap`) sandboxes.
 
+![Antigravity CLI riding in a flar](/assets/agy-in-a-flar.png)
+
 ## Features
 
 - **Bubblewrap Sandbox**: Runs the agent in an unprivileged user namespace using a clean root directory (`tmpfs`). System paths (`/usr`, `/bin`, `/lib`, `/lib64`, etc.) are mounted read-only from the host, ensuring host packages are immediately available without container image management.
