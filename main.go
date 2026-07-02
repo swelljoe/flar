@@ -169,7 +169,7 @@ func main() {
 	}
 
 	// 4. Copy credentials/configs to temp directory for mapping
-	tempConfig, err := PrepareConfigDir(selectedAgent)
+	tempConfig, err := PrepareConfigDir(selectedAgent, absProjectDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to prepare credentials: %v. Running anyway...\n", err)
 	}
