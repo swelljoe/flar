@@ -224,7 +224,6 @@ func RunSandbox(opts RunOpts) error {
 		bwrapArgs = append(bwrapArgs, "--bind", opts.TempNetDir, "/run/flar-net")
 	}
 
-
 	// Pass environment variables
 	bwrapArgs = append(bwrapArgs, "--setenv", "HOME", hostHome)
 	envVars := []string{
@@ -313,24 +312,61 @@ func RunSandbox(opts RunOpts) error {
 
 	bashScript.WriteString("exec \"$@\"\n")
 
-	// Append bash execution arguments to bwrap
-	bwrapArgs = append(bwrapArgs,
-		"--chdir", absProjectDir,
-		"/bin/bash", "-c", bashScript.String(),
-		"flar", // dummy $0
-	)
+	// --chdir is an option, so it travels with the rest through --args below.
+	bwrapArgs = append(bwrapArgs, "--chdir", absProjectDir)
 
-	// Append agent command and args
-	bwrapArgs = append(bwrapArgs, agentArgs...)
+	// The COMMAND and its args must stay on the real command line. bwrap only
+	// consumes options from an --args fd; the trailing command is read from argv.
+	commandArgs := []string{"/bin/bash", "-c", bashScript.String(), "flar" /* dummy $0 */}
+	commandArgs = append(commandArgs, agentArgs...)
 
 	if opts.Verbose {
-		fmt.Printf("Running command: bwrap %s\n", strings.Join(bwrapArgs, " "))
+		all := append(append([]string{}, bwrapArgs...), commandArgs...)
+		fmt.Printf("Running command: bwrap %s\n", strings.Join(all, " "))
 	}
 
-	cmd := exec.Command("bwrap", bwrapArgs...)
+	// Pass the bwrap options through a pipe via --args instead of on the command
+	// line. Otherwise the full mount layout (temp config paths, proxy socket,
+	// bind list) and every --setenv value — including any ANTHROPIC_API_KEY,
+	// GITHUB_TOKEN, etc. — show up in /proc/<pid>/cmdline, which the sandboxed
+	// agent can read for PID 1. With --args, argv is just "bwrap --args 3 <cmd>".
+	argsReader, argsWriter, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("failed to create args pipe: %w", err)
+	}
+	defer argsReader.Close()
+
+	cmd := exec.Command("bwrap", append([]string{"--args", "3"}, commandArgs...)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
+	cmd.ExtraFiles = []*os.File{argsReader} // becomes fd 3 in the child
 
-	return cmd.Run()
+	// Write in a goroutine so an argument blob larger than the pipe buffer can't
+	// deadlock against bwrap reading it.
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := argsWriter.Write(encodeBwrapArgs(bwrapArgs))
+		if cerr := argsWriter.Close(); err == nil {
+			err = cerr
+		}
+		writeErr <- err
+	}()
+
+	runErr := cmd.Run()
+	if werr := <-writeErr; werr != nil && runErr == nil {
+		return fmt.Errorf("failed to write bwrap args: %w", werr)
+	}
+	return runErr
+}
+
+// encodeBwrapArgs serializes arguments for bwrap's --args: each argument is
+// nul-terminated (including the last, which bwrap requires).
+func encodeBwrapArgs(args []string) []byte {
+	var buf []byte
+	for _, a := range args {
+		buf = append(buf, a...)
+		buf = append(buf, 0)
+	}
+	return buf
 }
