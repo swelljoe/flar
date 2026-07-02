@@ -10,18 +10,49 @@ import (
 
 // Config represents the settings read from a config file.
 type Config struct {
-	Agent    string `json:"agent"`
-	Template string `json:"template"`
-	Ask      bool   `json:"ask"`
+	Agent      string   `json:"agent"`
+	Ask        bool     `json:"ask"`
+	AllowPorts []int    `json:"allow_ports"`
+	Network    string   `json:"network"`
+}
+
+type intSlice []int
+
+func (i *intSlice) String() string {
+	return fmt.Sprintf("%v", *i)
+}
+
+func (i *intSlice) Set(value string) error {
+	var val int
+	if _, err := fmt.Sscan(value, &val); err != nil {
+		return err
+	}
+	*i = append(*i, val)
+	return nil
 }
 
 func main() {
+	// Check if this is an internal proxy execution inside the sandbox
+	if len(os.Args) >= 4 && os.Args[1] == "--internal-proxy" {
+		portStr := os.Args[2]
+		socketPath := os.Args[3]
+		var port int
+		if _, err := fmt.Sscan(portStr, &port); err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid port: %v\n", err)
+			os.Exit(1)
+		}
+		RunSandboxProxy(port, socketPath)
+		os.Exit(0)
+	}
+
 	// 1. Define command-line flags
 	agentFlag := flag.String("m", "", "Specify the agent to run (claude, codex, agy, copilot)")
-	templateFlag := flag.String("t", "", "Override the language template (go, rust, python, typescript, perl, generic)")
 	askFlag := flag.Bool("ask", false, "Disable bypass of agent permissions/approvals (ask for permission)")
-	rebuildFlag := flag.Bool("rebuild", false, "Force rebuilding the container image")
+	networkFlag := flag.String("network", "", "Network mode: isolated (default) or host")
 	verboseFlag := flag.Bool("v", false, "Enable verbose logging")
+
+	var allowPortsFlag intSlice
+	flag.Var(&allowPortsFlag, "allow-port", "Allow a specific local TCP port through the network sandbox (can specify multiple)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: flar [flags] [path/to/project] [extra agent args/prompts...]\n\n")
@@ -75,63 +106,52 @@ func main() {
 		os.Exit(1)
 	}
 
-	selectedLang := Language(*templateFlag)
-	if selectedLang == "" {
-		if config.Template != "" {
-			selectedLang = Language(config.Template)
-		} else {
-			selectedLang = DetectLanguage(absProjectDir)
-		}
-	}
-
-	// Validate template language
-	switch selectedLang {
-	case LangGo, LangRust, LangPython, LangTypeScript, LangPerl, LangGeneric:
-		// Valid
-	default:
-		fmt.Fprintf(os.Stderr, "Error: Unknown or unsupported language template: %s\n", selectedLang)
-		os.Exit(1)
-	}
-
 	askMode := *askFlag
 	if !askMode && config.Ask {
 		askMode = true
 	}
 
+	networkMode := *networkFlag
+	if networkMode == "" {
+		if config.Network != "" {
+			networkMode = config.Network
+		} else {
+			networkMode = "isolated"
+		}
+	}
+
+	if networkMode != "isolated" && networkMode != "host" {
+		fmt.Fprintf(os.Stderr, "Error: Unknown network mode: %s (must be 'isolated' or 'host')\n", networkMode)
+		os.Exit(1)
+	}
+
+	// Merge allowed ports from config and CLI flags
+	var allowPorts []int
+	portMap := make(map[int]bool)
+	for _, p := range config.AllowPorts {
+		if !portMap[p] {
+			portMap[p] = true
+			allowPorts = append(allowPorts, p)
+		}
+	}
+	for _, p := range allowPortsFlag {
+		if !portMap[p] {
+			portMap[p] = true
+			allowPorts = append(allowPorts, p)
+		}
+	}
+
 	if *verboseFlag {
 		fmt.Printf("Workspace: %s\n", absProjectDir)
-		fmt.Printf("Detected/Selected Language Template: %s\n", selectedLang)
 		fmt.Printf("Detected/Selected Agent: %s\n", selectedAgent)
 		fmt.Printf("Ask Mode: %v\n", askMode)
-	}
-
-	// 4. Resolve the Containerfile (custom or default)
-	customPath, inlineContent, err := ResolveContainerfile(absProjectDir, selectedLang, selectedAgent)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error resolving Containerfile: %v\n", err)
-		os.Exit(1)
-	}
-
-	// 5. Check and build the container image
-	imageName := fmt.Sprintf("flar-%s-%s:latest", selectedLang, selectedAgent)
-	exists, err := ImageExists(imageName)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error checking Podman image: %v\n", err)
-		os.Exit(1)
-	}
-
-	if !exists || *rebuildFlag {
-		if *verboseFlag {
-			fmt.Printf("Image %s does not exist or rebuild requested. Building...\n", imageName)
-		}
-		err = BuildImage(imageName, customPath, inlineContent, *verboseFlag)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error building image: %v\n", err)
-			os.Exit(1)
+		fmt.Printf("Network Mode: %s\n", networkMode)
+		if len(allowPorts) > 0 {
+			fmt.Printf("Allowed Local Ports: %v\n", allowPorts)
 		}
 	}
 
-	// 6. Copy credentials/configs to temp directory for mapping
+	// 4. Copy credentials/configs to temp directory for mapping
 	tempConfig, err := PrepareConfigDir(selectedAgent)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to prepare credentials: %v. Running anyway...\n", err)
@@ -140,19 +160,63 @@ func main() {
 		defer os.RemoveAll(tempConfig)
 	}
 
-	// 7. Run the container
-	err = RunContainer(RunOpts{
-		ImageName:  imageName,
+	// 5. Setup host-side network proxies if in isolated network mode
+	var tempNetDir string
+	var proxies []*PortProxy
+	var httpProxy *HttpProxy
+
+	if networkMode == "isolated" {
+		tempNetDir, err = os.MkdirTemp("", "flar-net-*")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating network proxy directory: %v\n", err)
+			os.Exit(1)
+		}
+		defer os.RemoveAll(tempNetDir)
+
+		// Start HTTP/HTTPS Proxy on host
+		httpProxySock := filepath.Join(tempNetDir, "http-proxy.sock")
+		httpProxy, err = StartHttpProxy(httpProxySock, allowPorts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error starting host HTTP proxy: %v\n", err)
+			os.Exit(1)
+		}
+		defer httpProxy.Close()
+
+		// Start TCP Port Proxies on host
+		for _, port := range allowPorts {
+			sockPath := filepath.Join(tempNetDir, fmt.Sprintf("port-%d.sock", port))
+			proxy, err := StartHostProxy(port, sockPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error starting host TCP proxy for port %d: %v\n", port, err)
+				for _, p := range proxies {
+					p.Close()
+				}
+				os.Exit(1)
+			}
+			proxies = append(proxies, proxy)
+		}
+	}
+	defer func() {
+		for _, p := range proxies {
+			p.Close()
+		}
+	}()
+
+	// 6. Run the Bubblewrap sandbox
+	err = RunSandbox(RunOpts{
 		ProjectDir: absProjectDir,
 		TempConfig: tempConfig,
+		TempNetDir: tempNetDir,
+		AllowPorts: allowPorts,
 		Agent:      selectedAgent,
+		Network:    networkMode,
 		AskMode:    askMode,
 		Verbose:    *verboseFlag,
 		ExtraArgs:  agentArgs,
 	})
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error running container: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error running sandbox: %v\n", err)
 		os.Exit(1)
 	}
 }

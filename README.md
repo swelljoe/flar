@@ -2,17 +2,34 @@
 
 FLAR is the Fast Light Agent Restrictor. It runs on rocks called gars.
 
-It is a simple, lightweight CLI tool in Go to run coding agent CLIs (like Claude Code, Antigravity, Codex, and Copilot) safely inside isolated `podman` containers.
+It is a simple, lightweight CLI tool in Go to run coding agent CLIs (like Claude Code, Antigravity, Codex, and Copilot) safely inside isolated Bubblewrap (`bwrap`) sandboxes.
 
 ## Features
 
-- **Auto-Detection Heuristics**: Automatically detects project environments (Go, Rust, Python, TypeScript, Perl) by scanning key files (e.g., `go.mod`, `Cargo.toml`, `pyproject.toml`) and parsing `.gitignore` patterns.
-- **Agent Sandbox**: Runs the agent inside a rootless container mapping the current workspace as `/workspace` with SELinux support (`:Z`).
-- **Dangerous Bypass Options**: Automatically injects flags (like `--dangerously-skip-permissions` for Claude and `agy`, or `--dangerously-bypass-approvals-and-sandbox` for Codex) so agents run without runtime approval interruptions. Can be disabled with `--ask`.
-- **Config Copying**: Automatically copies host credentials (like `~/.claude/`, `~/.codex/`, `~/.gemini/`, or GitHub CLI configurations) to a temporary directory mounted read-write inside the container so the host config files remain untouched.
-- **Custom Templates**: Allows users to specify project-local (`.flar/Containerfile`) or user-global (`~/.config/flar/templates/`) Containerfiles for custom environments.
+- **Bubblewrap Sandbox**: Runs the agent in an unprivileged user namespace using a clean root directory (`tmpfs`). System paths (`/usr`, `/bin`, `/lib`, `/lib64`, etc.) are mounted read-only from the host, ensuring host packages are immediately available without container image management.
+- **Strict Filesystem Isolation**: Only the target project directory is bind-mounted read-write. The rest of the host home directory is hidden, protecting ssh keys, shell configurations, and personal files from prompt injection attacks.
+- **Network Sandboxing**: 
+  - **Isolated Mode (Default)**: The network namespace is unshared. Internet access is tunneled through a host-side HTTP/HTTPS proxy that performs DNS lookup on the host and filters out traffic to local/loopback IP addresses.
+  - **Port Forwarding**: Selectively expose local services (e.g. databases, Ollama models) into the sandbox by mapping specific ports to the host's `localhost`.
+  - **Host Mode**: Option to share the host's network namespace for unconstrained access.
+- **Dangerous Bypass Options**: Automatically injects flags (like `--dangerously-skip-permissions` for Claude/`agy` or `--dangerously-bypass-approvals-and-sandbox` for Codex) so agents run without runtime approval interruptions. Can be disabled with `-ask`.
+- **Config Copying**: Automatically copies host credentials (like `~/.claude/`, `~/.codex/`, `~/.gemini/`, or GitHub CLI configurations) to a temporary directory mounted inside the sandbox home directory, leaving host config files untouched.
 
 ## Build and Install
+
+### Dependencies
+
+Ensure `bwrap` (Bubblewrap) is installed on your host system:
+
+```bash
+# On Fedora/RHEL
+sudo dnf install bubblewrap
+
+# On Debian/Ubuntu
+sudo apt install bubblewrap
+```
+
+### Compile & Install
 
 To build `flar` from source:
 
@@ -36,64 +53,29 @@ flar [flags] [path/to/project] [extra agent args/prompts...]
 
 ### Flags
 
-- `-m`: Specify the agent to run (`claude`, `codex`, `agy`, `copilot`). Defaults to checking available directories or environment variables.
-- `-t`: Override the language template (`go`, `rust`, `python`, `typescript`, `perl`, `generic`).
+- `-m`: Specify the agent to run (`claude`, `codex`, `agy`, `copilot`). Defaults to checking available host configurations or environment variables.
 - `-ask`: Do not skip permissions/approvals (forcing the agent to ask for permission).
-- `-rebuild`: Force rebuild the podman container image to update agent and packages.
+- `-network`: Network mode: `isolated` (default) or `host`.
+- `-allow-port`: Allow a specific local TCP port (e.g. `8080`, `11434`) through the isolated network sandbox. Can be specified multiple times.
 - `-v`: Enable verbose logging.
 
-If you only use one agent and your project only has one obvious language, you can run:
+### Configuration file (`.flar.json`)
 
-```
-flar
-```
+You can configure options per-project in `<project>/.flar.json` or globally in `~/.config/flar/config.json`:
 
-Inside your project directory.
-
-## Custom Containerfiles
-
-FLAR allows you to define your own Containerfiles to customize the build environment. This is useful if you want to include extra CLI tools, libraries, or system packages for the agent to use.
-
-### File Resolution Order
-
-When building the image for a given project language (`<lang>`) and agent (`<agent>`), FLAR searches for custom files in the following order:
-
-1. **Project-local exact override**: `<project>/.flar/Containerfile`
-2. **Project-local language & agent match**: `<project>/.flar/<lang>.<agent>.Containerfile`
-3. **Project-local language match**: `<project>/.flar/<lang>.Containerfile`
-4. **User-global language & agent match**: `~/.config/flar/templates/<lang>.<agent>.Containerfile`
-5. **User-global language match**: `~/.config/flar/templates/<lang>.Containerfile`
-6. **User-global generic & agent match**: `~/.config/flar/templates/generic.<agent>.Containerfile`
-7. **User-global generic fallback**: `~/.config/flar/templates/generic.Containerfile`
-8. **Built-in template fallback**: Internal defaults.
-
-### Writing a Custom Containerfile
-
-The ideal custom Containerfile would:
-1. Use a matching base image (e.g. `registry.fedoraproject.org/fedora:44` to align with the host), so you and the agent are working with the same tools.
-2. Install git, compilers, runtimes, and the target agent CLI.
-3. Set the working directory to `/workspace` so that mounted files are in the expected path.
-
-#### Example: Project-local Python with Claude Code (`.flar/Containerfile`)
-
-Here is an example `.flar/Containerfile` for a Python project that uses Claude Code and requires `sqlite-devel`, `tmux`, and `htop`:
-
-```dockerfile
-FROM registry.fedoraproject.org/fedora:44
-
-# Install basic toolchain and dependencies
-RUN dnf install -y python3 python3-pip python3-uv python3-ty gcc make sqlite-devel git ripgrep fd-find findutils coreutils tar unzip procps-ng && dnf clean all
-
-# Install Node.js & npm (required for Claude Code)
-RUN dnf install -y nodejs npm && dnf clean all
-
-# Install additional diagnostics/utilities
-RUN dnf install -y tmux htop vim && dnf clean all
-
-# Preinstall the agent
-RUN npm install -g @anthropic-ai/claude-code
-
-# Set workspace directory
-WORKDIR /workspace
+```json
+{
+  "agent": "claude",
+  "ask": false,
+  "network": "isolated",
+  "allow_ports": [5432, 11434]
+}
 ```
 
+## Network Security & Local Ports
+
+In **isolated** network mode, the agent's environment has no direct access to host network interfaces.
+
+* **Internet Access**: Works automatically for HTTP/HTTPS requests (such as connecting to cloud LLMs like Anthropic or Gemini) using the `HTTP_PROXY` and `HTTPS_PROXY` environment variables.
+* **Localhost Restrictions**: Requests to `localhost` or loopback IPs via the proxy are blocked.
+* **Exposing Local Services**: To let the agent reach a local database or local LLM (e.g. Ollama on `127.0.0.1:11434`), specify the port using `-allow-port 11434` or the `allow_ports` configuration. A secure loopback forwarder will bind `127.0.0.1:11434` inside the sandbox and proxy traffic to the host.
