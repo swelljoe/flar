@@ -200,6 +200,7 @@ func filterCodexHistory(src, dst string, ids map[string]bool) error {
 	}
 	defer out.Close()
 	s := bufio.NewScanner(in)
+	s.Buffer(make([]byte, 64*1024), 8*1024*1024)
 	for s.Scan() {
 		var row struct {
 			SessionID string `json:"session_id"`
