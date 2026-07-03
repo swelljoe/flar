@@ -112,6 +112,10 @@ func copyCodexState(src, dst, cwd string) (map[string]bool, error) {
 		}
 		ids[id] = true
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
