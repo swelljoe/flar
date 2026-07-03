@@ -2,13 +2,17 @@
 
 FLAR is the Fast Light Agent Restrictor. It runs on rocks called gars.
 
-It is a simple, lightweight CLI tool in Go to run coding agent CLIs (like Claude Code, Antigravity, Codex, and Copilot) safely inside isolated Bubblewrap (`bwrap`) sandboxes.
+It is a simple, lightweight CLI tool in Go to run coding agent CLIs (like Claude Code, Antigravity, Codex, and Copilot) safely inside isolated [Bubblewrap (`bwrap`) sandboxes](https://github.com/containers/bubblewrap).
 
 ![Antigravity CLI riding in a flar](/assets/agy-in-a-flar.png)
 
-The purpose is to *instantly* and without complicated configuration, bubblewrap an agent so it only has access to the project you're working on. This protects against prompt injections as well as supply chain issues in libraries the agent might pull into your project without sufficient vetting (or just bad luck). The only accessible sensitive information is the agent's own auth details and chat history for the project.
+The purpose is to *instantly* and without complicated configuration, bubblewrap an AI agent so it only has access to the project you're working on. This protects against prompt injections as well as supply chain issues in libraries the agent might pull into your project without sufficient vetting (or just bad luck). The only accessible sensitive information is the agent's own auth details and chat history for the project.
 
 Most agents have a "sandbox" feature, but it is quite porous and the agent itself can expand the scope of what's accessible. And, of course, supply chain vulnerabilities are not subject to the agent sandbox. `flar` is wholly impervious to the agent, and the blast radius of supply chain attacks tightly constrained.
+
+Bubblewrap is extremely well-tested, and actively maintained. It is used by Flatpack and many other projects for lightweight containers. `flar` is far less well-tested, and used by me for a couple of days.
+
+Codex is probably broken, as I don't have a GPT subscription. It certainly doesn't have project-scoped history like the others (thus, agent history can leak across projects, which is always true if you don't use `flar`, so no major concern there). I'll test it/fix it soon.
 
 ## Features
 
