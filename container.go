@@ -86,6 +86,18 @@ func RunSandbox(opts RunOpts) error {
 				hostAgentPath = defaultPath
 			}
 		}
+		// The current Copilot CLI installs as `copilot` in common setups, while
+		// older integrations may still refer to `github-copilot-cli`.
+		if opts.Agent == AgentCopilot && hostAgentPath == "" {
+			if p, lookupErr := exec.LookPath("copilot"); lookupErr == nil {
+				hostAgentPath = p
+			} else {
+				defaultPath := filepath.Join(hostHome, ".local", "bin", "copilot")
+				if _, statErr := os.Stat(defaultPath); statErr == nil {
+					hostAgentPath = defaultPath
+				}
+			}
+		}
 		if hostAgentPath == "" {
 			return fmt.Errorf("agent binary %q not found on host; please ensure it is in your PATH", agentCmd)
 		}
@@ -204,7 +216,11 @@ func RunSandbox(opts RunOpts) error {
 		case AgentCopilot:
 			copilotPath := filepath.Join(opts.TempConfig, ".copilot")
 			if _, err := os.Stat(copilotPath); err == nil {
-				bwrapArgs = append(bwrapArgs, "--bind", copilotPath, filepath.Join(hostHome, ".copilot"))
+				store, err := prepareCopilotStore(hostHome, absProjectDir, copilotPath)
+				if err != nil {
+					return fmt.Errorf("prepare copilot store: %w", err)
+				}
+				bwrapArgs = append(bwrapArgs, "--bind", store, filepath.Join(hostHome, ".copilot"))
 			}
 			ghPath := filepath.Join(opts.TempConfig, "gh")
 			if _, err := os.Stat(ghPath); err == nil {
@@ -331,7 +347,7 @@ func RunSandbox(opts RunOpts) error {
 			agentArgs = append(agentArgs, "--dangerously-skip-permissions")
 		}
 	case AgentCopilot:
-		agentArgs = append(agentArgs, "github-copilot-cli")
+		agentArgs = append(agentArgs, hostAgentPath)
 	}
 
 	if len(opts.ExtraArgs) > 0 {

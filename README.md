@@ -105,6 +105,14 @@ Because the sandbox mounts a temporary *copy* of your config, anything an agent 
 
 * **Claude**: transcripts live in a per-project directory (`~/.claude/projects/<project-slug>/`). flar binds only the current project's directory from the host over the copied config, so `claude --resume` sees this project's sessions and nothing else.
 
+* **Copilot CLI**: Copilot stores resumable sessions in two global places under `~/.copilot/`: a SQLite index (`session-store.db`) and one directory per session under `session-state/<session-id>/`. The SQLite rows carry the owning `cwd`, and each state directory is keyed by the same session ID. Binding the host store as-is would expose every project's sessions to a sandboxed Copilot, so flar gives each workspace its own shadow Copilot home:
+
+```
+~/.copilot/.flar/<project-slug>/
+```
+
+On first use, flar seeds that shadow home with only the sessions whose stored `cwd` matches the current workspace, copying both the relevant SQLite rows and the matching `session-state/` directories. After that, the whole shadow home is bind-mounted as `~/.copilot` inside the sandbox, so `copilot --continue` can resume only this workspace's sessions, and new sessions persist there safely.
+
 * **Antigravity (`agy`)**: this one is unusual and worth understanding.
 
 `agy` does **not** separate conversations by project on disk. Every conversation for every project lives in one flat store under `~/.gemini/antigravity-cli/` (`conversations/`, `brain/`, `implicit/`), keyed only by a UUID, with the owning workspace recorded *inside* opaque conversation blobs. A recency index (`cache/last_conversations.json`) maps each workspace to its most recent conversation, which is what `agy --continue` follows.
@@ -121,6 +129,7 @@ The first time flar runs `agy` in a project, it **seeds** that project's scoped 
 
 Consequences to be aware of:
 
+* **Copilot CLI**: as with `agy`, the scoped shadow home becomes a separate per-project world after the initial seed. Sessions you start with Copilot **outside** flar are not pulled into flar later, and sessions you start **inside** flar are saved back to the scoped shadow home rather than the host's global Copilot store.
 * Sessions you start with `agy` **outside** flar are (aside from the initial seed) not visible **inside** flar, and vice versa. This is deliberate — flar's `agy` history is a separate, per-project world.
 * A conversation that `agy`'s own indices never attributed to the current workspace is not seeded, by design. The safe default is to withhold it rather than risk exposing another project's data.
 * The scoped stores under `.flar/` are excluded from the config copy entirely, so no workspace's store can leak into another's sandbox even before the run-time bind is applied.

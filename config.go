@@ -93,7 +93,11 @@ func PrepareConfigDir(agent Agent, absProjectDir string) (string, error) {
 		srcCopilot := filepath.Join(home, ".copilot")
 		if _, err := os.Stat(srcCopilot); err == nil {
 			destCopilot := filepath.Join(tempDir, ".copilot")
-			if err := CopyDir(srcCopilot, destCopilot); err != nil {
+			// Copilot keeps resumable sessions in a global SQLite store plus
+			// per-session directories. Those are supplied at run time by a
+			// project-scoped shadow home, so copying them here would leak other
+			// projects' sessions into the sandbox.
+			if err := CopyDirExcept(srcCopilot, destCopilot, copilotSkipCopy); err != nil {
 				os.RemoveAll(tempDir)
 				return "", err
 			}
@@ -246,6 +250,19 @@ var agySkipCopy = map[string]bool{
 	filepath.Join("antigravity-cli", "history.jsonl"):                    true,
 	filepath.Join("antigravity-cli", "cache", "last_conversations.json"): true,
 	filepath.Join("antigravity-cli", agyStoreRel):                        true,
+}
+
+// copilotSkipCopy lists paths under ~/.copilot (relative to it) that flar does
+// NOT copy into the sandbox config. Copilot's resumable session history lives in
+// a global SQLite store plus session-state directories, so those are replaced at
+// run time by a project-scoped shadow home; the shadow homes themselves also
+// stay out of copied configs.
+var copilotSkipCopy = map[string]bool{
+	"session-state":        true,
+	"session-store.db":     true,
+	"session-store.db-wal": true,
+	"session-store.db-shm": true,
+	copilotStoreRel:        true,
 }
 
 // CopyDirExcept recursively copies src to dst, skipping any entry whose path
