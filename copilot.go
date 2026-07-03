@@ -2,7 +2,6 @@ package main
 
 import (
 	"database/sql"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -87,7 +86,7 @@ func seedCopilotSessionStore(srcPath, dstPath, absProjectDir string) ([]string, 
 	}
 	defer dstDB.Close()
 
-	if err := cloneSQLiteSchema(srcDB, dstDB); err != nil {
+	if err := initCopilotSessionSchema(dstDB); err != nil {
 		return nil, err
 	}
 
@@ -177,34 +176,74 @@ func openSQLite(path string) (*sql.DB, error) {
 	return db, nil
 }
 
-func cloneSQLiteSchema(srcDB, dstDB *sql.DB) error {
-	rows, err := srcDB.Query(`
-		SELECT sql
-		FROM sqlite_master
-		WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
-		ORDER BY CASE type
-			WHEN 'table' THEN 0
-			WHEN 'index' THEN 1
-			WHEN 'trigger' THEN 2
-			WHEN 'view' THEN 3
-			ELSE 4
-		END, name
-	`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var stmt string
-		if err := rows.Scan(&stmt); err != nil {
+func initCopilotSessionSchema(db *sql.DB) error {
+	for _, stmt := range []string{
+		`CREATE TABLE schema_version (
+			version INTEGER NOT NULL
+		)`,
+		`CREATE TABLE sessions (
+			id TEXT PRIMARY KEY,
+			cwd TEXT,
+			repository TEXT,
+			host_type TEXT,
+			branch TEXT,
+			summary TEXT,
+			created_at TEXT DEFAULT (datetime('now')),
+			updated_at TEXT DEFAULT (datetime('now'))
+		)`,
+		`CREATE INDEX idx_sessions_cwd ON sessions(cwd)`,
+		`CREATE INDEX idx_sessions_repo ON sessions(repository)`,
+		`CREATE TABLE turns (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT NOT NULL REFERENCES sessions(id),
+			turn_index INTEGER NOT NULL,
+			user_message TEXT,
+			assistant_response TEXT,
+			timestamp TEXT DEFAULT (datetime('now')),
+			UNIQUE(session_id, turn_index)
+		)`,
+		`CREATE INDEX idx_turns_session ON turns(session_id)`,
+		`CREATE TABLE checkpoints (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT NOT NULL REFERENCES sessions(id),
+			checkpoint_number INTEGER NOT NULL,
+			title TEXT,
+			overview TEXT,
+			history TEXT,
+			work_done TEXT,
+			technical_details TEXT,
+			important_files TEXT,
+			next_steps TEXT,
+			created_at TEXT DEFAULT (datetime('now')),
+			UNIQUE(session_id, checkpoint_number)
+		)`,
+		`CREATE INDEX idx_checkpoints_session ON checkpoints(session_id)`,
+		`CREATE TABLE session_files (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT NOT NULL REFERENCES sessions(id),
+			file_path TEXT NOT NULL,
+			tool_name TEXT,
+			turn_index INTEGER,
+			first_seen_at TEXT DEFAULT (datetime('now')),
+			UNIQUE(session_id, file_path)
+		)`,
+		`CREATE INDEX idx_session_files_path ON session_files(file_path)`,
+		`CREATE TABLE session_refs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT NOT NULL REFERENCES sessions(id),
+			ref_type TEXT NOT NULL,
+			ref_value TEXT NOT NULL,
+			turn_index INTEGER,
+			created_at TEXT DEFAULT (datetime('now')),
+			UNIQUE(session_id, ref_type, ref_value)
+		)`,
+		`CREATE INDEX idx_session_refs_type_value ON session_refs(ref_type, ref_value)`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
 			return err
 		}
-		if _, err := dstDB.Exec(stmt); err != nil {
-			return fmt.Errorf("clone sqlite schema: %w", err)
-		}
 	}
-	return rows.Err()
+	return nil
 }
 
 func copyCopilotSchemaVersion(srcDB *sql.DB, tx *sql.Tx) error {

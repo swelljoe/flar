@@ -71,7 +71,7 @@ func RunSandbox(opts RunOpts) error {
 	case AgentAgy:
 		agentCmd = "agy"
 	case AgentCopilot:
-		agentCmd = "github-copilot-cli"
+		agentCmd = "copilot"
 	default:
 		return fmt.Errorf("unknown or unsupported agent: %s", opts.Agent)
 	}
