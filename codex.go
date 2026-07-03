@@ -36,12 +36,12 @@ var codexSkipCopy = map[string]bool{
 func prepareCodexStore(hostHome, cwd, configSrc string) (string, error) {
 	hostCodex := filepath.Join(hostHome, ".codex")
 	store := filepath.Join(flarStateDir(hostHome), "codex", claudeProjectSlug(cwd))
-	if err := CopyDirExcept(configSrc, store, codexSkipCopy); err != nil {
-		return "", err
-	}
 	marker := filepath.Join(store, ".seeded")
 	if fileExists(marker) {
 		return store, nil
+	}
+	if err := CopyDirExcept(configSrc, store, codexSkipCopy); err != nil {
+		return "", err
 	}
 	if err := seedCodexStore(hostCodex, store, cwd); err != nil {
 		return "", err
