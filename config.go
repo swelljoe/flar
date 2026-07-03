@@ -72,7 +72,11 @@ func PrepareConfigDir(agent Agent, absProjectDir string) (string, error) {
 		srcAgy := filepath.Join(home, ".gemini")
 		if _, err := os.Stat(srcAgy); err == nil {
 			destAgy := filepath.Join(tempDir, ".gemini")
-			if err := CopyDir(srcAgy, destAgy); err != nil {
+			// Skip the conversation data and flar's per-workspace stores: the
+			// current workspace's conversations are supplied at run time by a
+			// scoped store bind (see prepareAgyStore), and copying the rest would
+			// pull every other project's conversation history into the sandbox.
+			if err := CopyDirExcept(srcAgy, destAgy, agySkipCopy); err != nil {
 				os.RemoveAll(tempDir)
 				return "", err
 			}
@@ -229,6 +233,63 @@ func CopyFile(src, dst string) error {
 	}
 
 	return dstFile.Sync()
+}
+
+// agySkipCopy lists paths under ~/.gemini (relative to it) that flar does NOT copy
+// into the sandbox config. The conversation directories and their indices are
+// replaced at run time by this workspace's scoped store; agyStoreRel holds every
+// workspace's scoped store and must never be exposed to another workspace.
+var agySkipCopy = map[string]bool{
+	filepath.Join("antigravity-cli", "conversations"):                    true,
+	filepath.Join("antigravity-cli", "brain"):                            true,
+	filepath.Join("antigravity-cli", "implicit"):                         true,
+	filepath.Join("antigravity-cli", "history.jsonl"):                    true,
+	filepath.Join("antigravity-cli", "cache", "last_conversations.json"): true,
+	filepath.Join("antigravity-cli", agyStoreRel):                        true,
+}
+
+// CopyDirExcept recursively copies src to dst, skipping any entry whose path
+// relative to src is present in skip.
+func CopyDirExcept(src, dst string, skip map[string]bool) error {
+	return copyDirRel(src, dst, "", skip)
+}
+
+func copyDirRel(src, dst, rel string, skip map[string]bool) error {
+	srcDir := filepath.Join(src, rel)
+	info, err := os.Stat(srcDir)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Join(dst, rel), info.Mode()); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		childRel := filepath.Join(rel, entry.Name())
+		if skip[childRel] {
+			continue
+		}
+		srcPath := filepath.Join(src, childRel)
+		if entry.IsDir() {
+			if err := copyDirRel(src, dst, childRel, skip); err != nil {
+				return err
+			}
+		} else {
+			fi, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			if fi.Mode().IsRegular() {
+				if err := CopyFile(srcPath, filepath.Join(dst, childRel)); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // CopyDir recursively copies a directory from src to dst.

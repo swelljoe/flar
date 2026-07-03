@@ -16,6 +16,7 @@ It is a simple, lightweight CLI tool in Go to run coding agent CLIs (like Claude
   - **Host Mode**: Option to share the host's network namespace for unconstrained access.
 - **Dangerous Bypass Options**: Automatically injects flags (like `--dangerously-skip-permissions` for Claude/`agy` or `--dangerously-bypass-approvals-and-sandbox` for Codex) so agents run without runtime approval interruptions. Can be disabled with `-ask`.
 - **Config Copying**: Automatically copies host credentials (like `~/.claude/`, `~/.codex/`, `~/.gemini/`, or GitHub CLI configurations) to a temporary directory mounted inside the sandbox home directory, leaving host config files untouched.
+- **Session Persistence & Resume**: Conversations started inside a sandbox are written back to the host, so `--resume`/`--continue` works across runs — scoped to the current project so no other project's history enters the sandbox. See [Session persistence & resume](#session-persistence--resume).
 - **Keyring Bridging (`agy`)**: The Antigravity CLI stores its OAuth token in the OS keyring rather than a file. flar extracts only that one secret and serves it inside the sandbox through a private, in-process Secret Service — so the agent authenticates without exposing the rest of your keyring. See [Credentials](#credentials).
 
 ## Build and Install
@@ -97,6 +98,32 @@ Requirements and caveats:
 
 * Host-side extraction needs `secret-tool` (libsecret) installed on the host. If it is absent or the token is not found, flar skips the bridge and `agy` falls back to its normal login prompt.
 * Any authenticated agent can, by definition, read its own token; a prompt-injection attack could exfiltrate it. This is inherent to running authenticated at all. The keyring bridge limits the exposure to that one token rather than your entire keyring.
+
+## Session persistence & resume
+
+Because the sandbox mounts a temporary *copy* of your config, anything an agent writes there would normally vanish on exit — including the conversation it just had. flar binds each agent's transcript storage back to the host so sessions persist and can be resumed later, while keeping other projects' history out of the sandbox.
+
+* **Claude**: transcripts live in a per-project directory (`~/.claude/projects/<project-slug>/`). flar binds only the current project's directory from the host over the copied config, so `claude --resume` sees this project's sessions and nothing else.
+
+* **Antigravity (`agy`)**: this one is unusual and worth understanding.
+
+`agy` does **not** separate conversations by project on disk. Every conversation for every project lives in one flat store under `~/.gemini/antigravity-cli/` (`conversations/`, `brain/`, `implicit/`), keyed only by a UUID, with the owning workspace recorded *inside* opaque conversation blobs. A recency index (`cache/last_conversations.json`) maps each workspace to its most recent conversation, which is what `agy --continue` follows.
+
+Binding that store into the sandbox as-is would let a sandboxed `agy` resume — via `--continue`, the interactive picker, or an explicit `--conversation <ID>` — a conversation belonging to a *different* project, leaking whatever was pasted into it. To prevent that, flar gives each workspace its own **scoped store**:
+
+```
+~/.gemini/antigravity-cli/.flar/<project-slug>/
+```
+
+This directory is bind-mounted over `conversations/`, `brain/`, `implicit/`, `history.jsonl`, and `cache/last_conversations.json` inside the sandbox. A sandbox opened on project A can therefore only ever see project A's conversations. New sessions accumulate in the scoped store and are resumable on the next run.
+
+The first time flar runs `agy` in a project, it **seeds** that project's scoped store from your existing host history — but only with conversations `agy` itself attributes to this workspace (determined from the plain-text `last_conversations.json` and `history.jsonl`, never by parsing the conversation blobs). After that one-time seed the scoped store is independent: new sessions live only in the scoped store, and later host-side changes are not pulled in.
+
+Consequences to be aware of:
+
+* Sessions you start with `agy` **outside** flar are (aside from the initial seed) not visible **inside** flar, and vice versa. This is deliberate — flar's `agy` history is a separate, per-project world.
+* A conversation that `agy`'s own indices never attributed to the current workspace is not seeded, by design. The safe default is to withhold it rather than risk exposing another project's data.
+* The scoped stores under `.flar/` are excluded from the config copy entirely, so no workspace's store can leak into another's sandbox even before the run-time bind is applied.
 
 ## Network Security & Local Ports
 

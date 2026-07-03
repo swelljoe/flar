@@ -18,6 +18,24 @@ const (
 	AgentCopilot Agent = "copilot"
 )
 
+// ensureFile creates an empty file (and its parent directories) if it does not
+// already exist, returning true if the file exists afterward. Used to guarantee a
+// bind source is present before mounting it.
+func ensureFile(path string) bool {
+	if _, err := os.Stat(path); err == nil {
+		return true
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return false
+	}
+	f, err := os.OpenFile(path, os.O_CREATE, 0o600)
+	if err != nil {
+		return false
+	}
+	f.Close()
+	return true
+}
+
 // RunOpts holds parameters for running the Bubblewrap sandbox.
 type RunOpts struct {
 	ProjectDir string
@@ -157,6 +175,26 @@ func RunSandbox(opts RunOpts) error {
 			agyPath := filepath.Join(opts.TempConfig, ".gemini")
 			if _, err := os.Stat(agyPath); err == nil {
 				bwrapArgs = append(bwrapArgs, "--bind", agyPath, filepath.Join(hostHome, ".gemini"))
+
+				// Bind this workspace's private, scoped agy conversation store over
+				// the copied config. Sessions created in the sandbox persist and can
+				// be resumed with `agy --continue` / `--conversation`, while other
+				// projects' conversations stay invisible. agy keeps every
+				// conversation in one flat global store, so flar partitions it per
+				// workspace here (see prepareAgyStore).
+				if store, err := prepareAgyStore(hostHome, absProjectDir); err == nil {
+					agyDir := filepath.Join(hostHome, ".gemini", "antigravity-cli")
+					for _, sub := range agyStoreDirs {
+						bwrapArgs = append(bwrapArgs, "--bind",
+							filepath.Join(store, sub), filepath.Join(agyDir, sub))
+					}
+					bwrapArgs = append(bwrapArgs, "--bind",
+						filepath.Join(store, "history.jsonl"),
+						filepath.Join(agyDir, "history.jsonl"))
+					bwrapArgs = append(bwrapArgs, "--bind",
+						filepath.Join(store, "cache", "last_conversations.json"),
+						filepath.Join(agyDir, "cache", "last_conversations.json"))
+				}
 			}
 			secretPath := filepath.Join(opts.TempConfig, agySecretFile)
 			if _, err := os.Stat(secretPath); err == nil {
