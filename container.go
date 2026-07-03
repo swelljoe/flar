@@ -181,7 +181,11 @@ func RunSandbox(opts RunOpts) error {
 		case AgentCodex:
 			codexPath := filepath.Join(opts.TempConfig, ".codex")
 			if _, err := os.Stat(codexPath); err == nil {
-				bwrapArgs = append(bwrapArgs, "--bind", codexPath, filepath.Join(hostHome, ".codex"))
+				store, err := prepareCodexStore(hostHome, absProjectDir, codexPath)
+				if err != nil {
+					return fmt.Errorf("prepare Codex store: %w", err)
+				}
+				bwrapArgs = append(bwrapArgs, "--bind", store, filepath.Join(hostHome, ".codex"))
 			}
 		case AgentAgy:
 			agyPath := filepath.Join(opts.TempConfig, ".gemini")

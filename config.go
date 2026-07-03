@@ -62,7 +62,10 @@ func PrepareConfigDir(agent Agent, absProjectDir string) (string, error) {
 		srcCodex := filepath.Join(home, ".codex")
 		if _, err := os.Stat(srcCodex); err == nil {
 			destCodex := filepath.Join(tempDir, ".codex")
-			if err := CopyDir(srcCodex, destCodex); err != nil {
+			// Conversation state and flar's shadow homes are supplied at run
+			// time by prepareCodexStore. Copying either here would expose other
+			// projects' sessions to the sandbox.
+			if err := CopyDirExcept(srcCodex, destCodex, codexSkipCopy); err != nil {
 				os.RemoveAll(tempDir)
 				return "", err
 			}

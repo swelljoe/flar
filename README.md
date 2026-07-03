@@ -12,8 +12,6 @@ Most agents have a "sandbox" feature, but it is quite porous and the agent itsel
 
 Bubblewrap is extremely well-tested, and actively maintained. It is used by Flatpack and many other projects for lightweight containers. `flar` is far less well-tested, and used by me for a couple of days.
 
-Codex is probably broken, as I don't have a GPT subscription. It certainly doesn't have project-scoped history like the others (thus, agent history can leak across projects, which is always true if you don't use `flar`, so no major concern there). I'll test it/fix it soon.
-
 ## Features
 
 - **Bubblewrap Sandbox**: Runs the agent in an unprivileged user namespace using a clean root directory (`tmpfs`). System paths (`/usr`, `/bin`, `/lib`, `/lib64`, etc.) are mounted read-only from the host, ensuring host packages are immediately available without container image management.
@@ -113,6 +111,8 @@ Because the sandbox mounts a temporary *copy* of your config, anything an agent 
 
 * **Claude**: transcripts live in a per-project directory (`~/.claude/projects/<project-slug>/`). `flar` binds only the current project's directory from the host over the copied config, so `claude --resume` sees this project's sessions and nothing else.
 
+* **Codex CLI**: Codex stores transcripts under date-based directories in `~/.codex/sessions/` and indexes them in the global `state_5.sqlite`; both record each thread's `cwd`, but the on-disk directories mix projects. `flar` gives each workspace a shadow Codex home under `$XDG_STATE_HOME/flar/codex/<project-slug>/`, falling back to `~/.local/state/flar/codex/<project-slug>/` when that variable is unset. On first use it seeds that home with only matching transcript files, SQLite rows, and prompt-history entries. The shadow home is then mounted as `~/.codex`, so new sessions persist without exposing another project to `codex resume --all`.
+
 * **Copilot CLI**: Copilot stores resumable sessions in two global places under `~/.copilot/`: a SQLite index (`session-store.db`) and one directory per session under `session-state/<session-id>/`. The SQLite rows carry the owning `cwd`, and each state directory is keyed by the same session ID. Binding the host store as-is would expose every project's sessions to a sandboxed Copilot, so `flar` gives each workspace its own shadow Copilot home:
 
 ```
@@ -139,8 +139,9 @@ Consequences to be aware of:
 
 * **Copilot CLI**: as with `agy`, the scoped shadow home becomes a separate per-project world after the initial seed. Sessions you start with Copilot **outside** `flar` are not pulled into `flar` later, and sessions you start **inside** `flar` are saved back to the scoped shadow home rather than the host's global Copilot store.
 * Sessions you start with `agy` **outside** `flar` are (aside from the initial seed) not visible **inside** flar, and vice versa. This is deliberate — flar's `agy` history is a separate, per-project world.
+* Codex follows the same rule: after the one-time seed, wrapped and unwrapped Codex histories are independent.
 * A conversation that `agy`'s own indices never attributed to the current workspace is not seeded, by design. The safe default is to withhold it rather than risk exposing another project's data.
-* The scoped stores under `.flar/` are excluded from the config copy entirely, so no workspace's store can leak into another's sandbox even before the run-time bind is applied.
+* Agent-owned `.flar/` directories are excluded from config copies for compatibility, and flar-owned state lives under `$XDG_STATE_HOME/flar/` (or `~/.local/state/flar/`), outside agent-managed configuration directories.
 
 ## Network Security & Local Ports
 
