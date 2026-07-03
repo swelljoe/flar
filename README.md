@@ -6,7 +6,9 @@ It is a simple, lightweight CLI tool in Go to run coding agent CLIs (like Claude
 
 ![Antigravity CLI riding in a flar](/assets/agy-in-a-flar.png)
 
-The purpose is to *instantly* and without complicated configuration, bubblewrap and agent, so it only has access to the project you're working on.
+The purpose is to *instantly* and without complicated configuration, bubblewrap an agent so it only has access to the project you're working on. This protects against prompt injections as well as supply chain issues in libraries the agent might pull into your project without sufficient vetting (or just bad luck). The only accessible sensitive information is the agent's own auth details and chat history for the project.
+
+Most agents have a "sandbox" feature, but it is quite porous and the agent itself can expand the scope of what's accessible. And, of course, supply chain vulnerabilities are not subject to the agent sandbox. `flar` is wholly impervious to the agent, and the blast radius of supply chain attacks tightly constrained.
 
 ## Features
 
