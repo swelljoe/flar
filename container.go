@@ -133,6 +133,16 @@ func RunSandbox(opts RunOpts) error {
 			claudePath := filepath.Join(opts.TempConfig, ".claude")
 			if _, err := os.Stat(claudePath); err == nil {
 				bwrapArgs = append(bwrapArgs, "--bind", claudePath, filepath.Join(hostHome, ".claude"))
+
+				// Live-bind only THIS project's transcript directory from the host
+				// (over the copied .claude), so sessions run in the sandbox are
+				// written straight to disk and can be resumed. The bind is scoped to
+				// one project's slug, so other projects' history stays invisible.
+				slug := claudeProjectSlug(absProjectDir)
+				hostProj := filepath.Join(hostHome, ".claude", "projects", slug)
+				if err := os.MkdirAll(hostProj, 0o700); err == nil {
+					bwrapArgs = append(bwrapArgs, "--bind", hostProj, hostProj)
+				}
 			}
 			claudeJSONPath := filepath.Join(opts.TempConfig, ".claude.json")
 			if _, err := os.Stat(claudeJSONPath); err == nil {

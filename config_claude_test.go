@@ -20,9 +20,10 @@ func TestClaudeProjectSlug(t *testing.T) {
 	}
 }
 
-// TestCopyClaudeConfigIsolation verifies that only allowlisted entries and the
-// current project's transcripts are copied, and that other projects' history and
-// unrelated cross-session data are left behind.
+// TestCopyClaudeConfigIsolation verifies that only allowlisted entries are copied,
+// and that other projects' history and unrelated cross-session data are left behind.
+// The current project's transcripts are intentionally NOT copied here; RunSandbox
+// live-binds them from the host instead.
 func TestCopyClaudeConfigIsolation(t *testing.T) {
 	src := t.TempDir()
 	dst := filepath.Join(t.TempDir(), ".claude")
@@ -39,7 +40,8 @@ func TestCopyClaudeConfigIsolation(t *testing.T) {
 	writeFile(t, filepath.Join(src, "shell-snapshots", "snap.sh"), "env")
 	writeFile(t, filepath.Join(src, "projects", "-home-joe-src-other", "t.jsonl"), "OTHER transcript")
 
-	// Current project's transcripts, which must survive for --resume.
+	// Current project's transcripts exist on the host but must NOT be copied; they
+	// are live-bound by RunSandbox instead.
 	proj := "/home/joe/src/flar"
 	writeFile(t, filepath.Join(src, "projects", claudeProjectSlug(proj), "t.jsonl"), "flar transcript")
 
@@ -51,13 +53,13 @@ func TestCopyClaudeConfigIsolation(t *testing.T) {
 	mustExist(t, dst, "settings.json")
 	mustExist(t, dst, "CLAUDE.md")
 	mustExist(t, dst, filepath.Join("plugins", "p.json"))
-	mustExist(t, dst, filepath.Join("projects", claudeProjectSlug(proj), "t.jsonl"))
 
 	mustAbsent(t, dst, "history.jsonl")
 	mustAbsent(t, dst, filepath.Join("sessions", "s.json"))
 	mustAbsent(t, dst, filepath.Join("shell-snapshots", "snap.sh"))
 	mustAbsent(t, dst, filepath.Join("projects", "-home-joe-src-other", "t.jsonl"))
 	mustAbsent(t, dst, filepath.Join("projects", "-home-joe-src-other"))
+	mustAbsent(t, dst, "projects") // no transcripts copied at all now
 }
 
 // TestCopyClaudeJSONFiltersProjects verifies the per-project map is reduced to the

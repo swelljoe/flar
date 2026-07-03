@@ -111,7 +111,8 @@ func PrepareConfigDir(agent Agent, absProjectDir string) (string, error) {
 // agent legitimately needs. Everything not listed — notably projects/ (transcripts
 // of OTHER projects), history.jsonl, sessions/, shell-snapshots/, and file-history/
 // — is cross-project data the agent has no reason to read, so it is left out. The
-// current project's own transcripts are copied separately (see copyClaudeConfig).
+// current project's own transcripts are not copied here; they are live-bound from
+// the host (see RunSandbox) so sessions run in the sandbox persist and can resume.
 var claudeConfigAllowlist = []string{
 	".credentials.json",   // OAuth token; required for auth
 	"settings.json",       // user settings
@@ -122,11 +123,16 @@ var claudeConfigAllowlist = []string{
 	"commands",            // custom slash commands
 }
 
-// copyClaudeConfig copies only the allowlisted entries of ~/.claude into dst, plus
-// the projects/ subdirectory for the current project alone (used for session
-// resume). It deliberately does not mirror the whole directory, which would expose
-// every other project's conversation history to the sandboxed agent.
+// copyClaudeConfig copies only the allowlisted entries of ~/.claude into dst. It
+// deliberately does not mirror the whole directory, which would expose every other
+// project's conversation history to the sandboxed agent. The current project's own
+// transcripts are not copied; RunSandbox live-binds them from the host so sessions
+// run in the sandbox persist and can be resumed.
+//
+// absProjectDir is retained for signature symmetry with copyClaudeJSON and to keep
+// the per-project scoping decision visible at the one call site.
 func copyClaudeConfig(src, dst, absProjectDir string) error {
+	_ = absProjectDir
 	if err := os.MkdirAll(dst, 0o700); err != nil {
 		return err
 	}
@@ -145,15 +151,6 @@ func copyClaudeConfig(src, dst, absProjectDir string) error {
 			if err := CopyFile(srcPath, dstPath); err != nil {
 				return err
 			}
-		}
-	}
-	// Scope projects/ to just the current project's transcripts so --resume works
-	// without dragging in other projects' history.
-	slug := claudeProjectSlug(absProjectDir)
-	srcProj := filepath.Join(src, "projects", slug)
-	if info, err := os.Stat(srcProj); err == nil && info.IsDir() {
-		if err := CopyDir(srcProj, filepath.Join(dst, "projects", slug)); err != nil {
-			return err
 		}
 	}
 	return nil
