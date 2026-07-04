@@ -22,7 +22,7 @@ Bubblewrap is extremely well-tested, and actively maintained. It is used by Flat
   - **Host Mode**: Option to share the host's network namespace for unconstrained access.
 - **Dangerous Bypass Options**: Automatically injects flags (like `--dangerously-skip-permissions` for Claude/`agy` or `--dangerously-bypass-approvals-and-sandbox` for Codex) so agents run without runtime approval interruptions. Can be disabled with `-ask`.
 - **Config Copying**: Automatically copies host credentials (like `~/.claude/`, `~/.codex/`, `~/.gemini/`, or GitHub CLI configurations) to a temporary directory mounted inside the sandbox home directory, leaving host config files untouched.
-- **Session Persistence & Resume**: Conversations started inside a sandbox are written back to the host, so `--resume`/`--continue` works across runs — scoped to the current project so no other project's history enters the sandbox. See [Session persistence & resume](#session-persistence--resume).
+- **Session Persistence & Resume**: When safe (currently just Claude Code), conversations started inside a sandbox are written back to the host, so `--resume`/`--continue` works across runs — scoped to the current project so no other project's history enters the sandbox. Otherwise, history is forked on first run of `flar` for a given agent and project. See [Session persistence & resume](#session-persistence--resume).
 - **Keyring Bridging (`agy`)**: The Antigravity CLI stores its OAuth token in the OS keyring rather than a file. `flar` extracts only that one secret and serves it inside the sandbox through a private, in-process Secret Service — so the agent authenticates without exposing the rest of your keyring. See [Credentials](#credentials).
 
 ## Build and Install
