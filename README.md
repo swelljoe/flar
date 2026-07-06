@@ -2,7 +2,7 @@
 
 FLAR is the Fast Light Agent Restrictor. It runs on rocks called gars.
 
-It is a simple, lightweight CLI tool in Go to run coding agent CLIs (like Claude Code, Antigravity, Codex, and Copilot) safely inside isolated [Bubblewrap (`bwrap`) sandboxes](https://github.com/containers/bubblewrap).
+It is a simple, lightweight CLI tool in Go to run coding agent CLIs (like Claude Code, Antigravity, Codex, Copilot and Reasonix) safely inside isolated [Bubblewrap (`bwrap`) sandboxes](https://github.com/containers/bubblewrap).
 
 ![Antigravity CLI riding in a flar](/assets/agy-in-a-flar.png)
 
@@ -22,7 +22,7 @@ Bubblewrap is extremely well-tested, and actively maintained. It is used by Flat
   - **Host Mode**: Option to share the host's network namespace for unconstrained access.
 - **Dangerous Bypass Options**: Automatically injects flags (like `--dangerously-skip-permissions` for Claude/`agy` or `--dangerously-bypass-approvals-and-sandbox` for Codex) so agents run without runtime approval interruptions. Can be disabled with `-ask`.
 - **Config Copying**: Automatically copies host credentials (like `~/.claude/`, `~/.codex/`, `~/.gemini/`, or GitHub CLI configurations) to a temporary directory mounted inside the sandbox home directory, leaving host config files untouched.
-- **Session Persistence & Resume**: When safe (currently just Claude Code), conversations started inside a sandbox are written back to the host, so `--resume`/`--continue` works across runs — scoped to the current project so no other project's history enters the sandbox. Otherwise, history is forked on first run of `flar` for a given agent and project. See [Session persistence & resume](#session-persistence--resume).
+- **Session Persistence & Resume**: When reasonably safe (currently Claude Code),nd Reasonix conversations started inside a sandbox are written back to the host, so `--resume`/`--continue` works across runs — scoped to the current project so no other project's history enters the sandbox. Otherwise, history is forked on first run of `flar` for a given agent and project. See [Session persistence & resume](#session-persistence--resume).
 - **Keyring Bridging (`agy`)**: The Antigravity CLI stores its OAuth token in the OS keyring rather than a file. `flar` extracts only that one secret and serves it inside the sandbox through a private, in-process Secret Service — so the agent authenticates without exposing the rest of your keyring. See [Credentials](#credentials).
 
 ## Build and Install
@@ -63,7 +63,7 @@ flar [flags] [path/to/project] [extra agent args/prompts...]
 
 ### Flags
 
-- `-m`: Specify the agent to run (`claude`, `codex`, `agy`, `copilot`). Defaults to checking available host configurations or environment variables.
+- `-m`: Specify the agent to run (`claude`, `codex`, `agy`, `copilot`, `reasonix`). Defaults to checking available host configurations or environment variables.
 - `-ask`: Do not skip permissions/approvals (forcing the agent to ask for permission).
 - `-network`: Network mode: `isolated` (default) or `host`.
 - `-allow-port`: Allow a specific local TCP port (e.g. `8080`, `11434`) through the isolated network sandbox. Can be specified multiple times.
@@ -109,7 +109,7 @@ Requirements and caveats:
 
 Because the sandbox mounts a temporary *copy* of your config, anything an agent writes there would normally vanish on exit — including the conversation it just had. `flar` binds each agent's transcript storage back to the host so sessions persist and can be resumed later, while keeping other projects' history out of the sandbox.
 
-* **Claude**: transcripts live in a per-project directory (`~/.claude/projects/<project-slug>/`). `flar` binds only the current project's directory from the host over the copied config, so `claude --resume` sees this project's sessions and nothing else.
+* **Claude**: transcripts live in a per-project directory (`~/.claude/projects/<project-slug>/`). `flar` binds only the current project's directory from the host over the copied config, so `claude --resume` sees this project's sessions and nothing else. Beware this means a prompt injection stored in history might still be a risk, if you resume a session that contains a working prompt injection, the blast radius gets infinitely larger if you run `claude` outside of `flar`. I think the convenience outweighs the risk, for any projects that have that kind of risk, just always run it in `flar`.
 
 * **Codex CLI**: Codex stores transcripts under date-based directories in `~/.codex/sessions/` and indexes them in the global `state_5.sqlite`; both record each thread's `cwd`, but the on-disk directories mix projects. `flar` gives each workspace a shadow Codex home under `$XDG_STATE_HOME/flar/codex/<project-slug>/`, falling back to `~/.local/state/flar/codex/<project-slug>/` when that variable is unset. On first use it seeds that home with only matching transcript files, SQLite rows, and prompt-history entries. The shadow home is then mounted as `~/.codex`, so new sessions persist without exposing another project to `codex resume --all`.
 
@@ -134,6 +134,8 @@ Binding that store into the sandbox as-is would let a sandboxed `agy` resume —
 This directory is bind-mounted over `conversations/`, `brain/`, `implicit/`, `history.jsonl`, and `cache/last_conversations.json` inside the sandbox. A sandbox opened on project A can therefore only ever see project A's conversations. New sessions accumulate in the scoped store and are resumable on the next run.
 
 The first time `flar` runs `agy` in a project, it seeds that project's scoped store from your existing host history — but only with conversations `agy` itself attributes to this workspace (determined from the plain-text `last_conversations.json` and `history.jsonl`, never by parsing the conversation blobs). After that one-time seed the scoped store is independent: new sessions live only in the scoped store, and later host-side changes are not pulled in.
+
+* **Reasonix**: Just like Claude Code. Reasonix keeps each project history in its own subdirectory directory, so it can be bindmounted in the same way as Claude Code, with the same caveat.
 
 Consequences to be aware of:
 
