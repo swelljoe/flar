@@ -29,7 +29,7 @@ func TestHelloReplyGolden(t *testing.T) {
 		0x05, 0x01, 0x75, 0x00, 0x01, 0x00, 0x00, 0x00,
 		// SIGNATURE (code 8), variant sig "g", value "s"
 		0x08, 0x01, 0x67, 0x00, 0x01, 0x73, 0x00,
-		0x00,                                     // pad to 8 before body
+		0x00,                                             // pad to 8 before body
 		0x04, 0x00, 0x00, 0x00, ':', '1', '.', '1', 0x00, // body: string ":1.1"
 	}
 	if !bytes.Equal(got, want) {

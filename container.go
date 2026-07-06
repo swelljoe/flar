@@ -12,10 +12,11 @@ import (
 type Agent string
 
 const (
-	AgentClaude  Agent = "claude"
-	AgentCodex   Agent = "codex"
-	AgentAgy     Agent = "agy"
-	AgentCopilot Agent = "copilot"
+	AgentClaude   Agent = "claude"
+	AgentCodex    Agent = "codex"
+	AgentAgy      Agent = "agy"
+	AgentCopilot  Agent = "copilot"
+	AgentReasonix Agent = "reasonix"
 )
 
 // ensureFile creates an empty file (and its parent directories) if it does not
@@ -72,6 +73,8 @@ func RunSandbox(opts RunOpts) error {
 		agentCmd = "agy"
 	case AgentCopilot:
 		agentCmd = "copilot"
+	case AgentReasonix:
+		agentCmd = "reasonix"
 	default:
 		return fmt.Errorf("unknown or unsupported agent: %s", opts.Agent)
 	}
@@ -231,6 +234,22 @@ func RunSandbox(opts RunOpts) error {
 				bwrapArgs = append(bwrapArgs, "--dir", filepath.Join(hostHome, ".config"))
 				bwrapArgs = append(bwrapArgs, "--bind", ghPath, filepath.Join(hostHome, ".config", "gh"))
 			}
+		case AgentReasonix:
+			reasonixPath := filepath.Join(opts.TempConfig, ".reasonix")
+			if _, err := os.Stat(reasonixPath); err == nil {
+				bwrapArgs = append(bwrapArgs, "--bind", reasonixPath, filepath.Join(hostHome, ".reasonix"))
+
+				// Live-bind only THIS project's session directory from the host
+				// (over the copied .reasonix), so sessions run in the sandbox are
+				// written straight to disk and can be resumed. Reasonix encodes
+				// project paths the same way as Claude — replacing every
+				// non-alphanumeric character with '-'.
+				slug := claudeProjectSlug(absProjectDir)
+				hostProj := filepath.Join(hostHome, ".reasonix", "projects", slug)
+				if err := os.MkdirAll(hostProj, 0o700); err == nil {
+					bwrapArgs = append(bwrapArgs, "--bind", hostProj, hostProj)
+				}
+			}
 		}
 
 		// Git config
@@ -306,6 +325,7 @@ func RunSandbox(opts RunOpts) error {
 		"GITHUB_TOKEN",
 		"GH_TOKEN",
 		"COPILOT_GITHUB_TOKEN",
+		"DEEPSEEK_API_KEY",
 	}
 	for _, env := range envVars {
 		if val, exists := os.LookupEnv(env); exists {
@@ -352,6 +372,11 @@ func RunSandbox(opts RunOpts) error {
 		}
 	case AgentCopilot:
 		agentArgs = append(agentArgs, hostAgentPath)
+	case AgentReasonix:
+		agentArgs = append(agentArgs, "reasonix")
+		if !opts.AskMode {
+			agentArgs = append(agentArgs, "--yolo")
+		}
 	}
 
 	if len(opts.ExtraArgs) > 0 {

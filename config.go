@@ -113,6 +113,23 @@ func PrepareConfigDir(agent Agent, absProjectDir string) (string, error) {
 				return "", err
 			}
 		}
+
+	case AgentReasonix:
+		srcReasonix := filepath.Join(home, ".reasonix")
+		if _, err := os.Stat(srcReasonix); err == nil {
+			destReasonix := filepath.Join(tempDir, ".reasonix")
+			// Reasonix sessions are already project-scoped on disk
+			// (~/.reasonix/projects/<slug>/), so flar copies only the global
+			// config and secrets, then live-binds the current project's
+			// directory at run time — the same pattern used for Claude.
+			// projects/ and sessions/ are deliberately skipped: the current
+			// project's sessions are live-bound from the host, and copying them
+			// here would expose every other project's session history.
+			if err := CopyDirExcept(srcReasonix, destReasonix, reasonixSkipCopy); err != nil {
+				os.RemoveAll(tempDir)
+				return "", err
+			}
+		}
 	}
 
 	return tempDir, nil
@@ -266,6 +283,16 @@ var copilotSkipCopy = map[string]bool{
 	"session-store.db-wal": true,
 	"session-store.db-shm": true,
 	copilotStoreRel:        true,
+}
+
+// reasonixSkipCopy lists paths under ~/.reasonix (relative to it) that flar does
+// NOT copy into the sandbox config. Reasonix already scopes sessions per-project
+// on disk (~/.reasonix/projects/<slug>/), so the current project's directory is
+// live-bound at run time. Copying projects/ or sessions/ here would leak other
+// projects' history into the sandbox.
+var reasonixSkipCopy = map[string]bool{
+	"projects": true,
+	"sessions": true,
 }
 
 // CopyDirExcept recursively copies src to dst, skipping any entry whose path

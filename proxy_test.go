@@ -27,7 +27,7 @@ func TestHttpProxy(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	sockPath := filepath.Join(tmpDir, "http.sock")
-	
+
 	// Start host proxy allowing port 8080 (but not upstream's port)
 	allowPorts := []int{8080}
 	proxy, err := StartHttpProxy(sockPath, allowPorts)

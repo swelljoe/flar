@@ -10,10 +10,10 @@ import (
 
 // Config represents the settings read from a config file.
 type Config struct {
-	Agent      string   `json:"agent"`
-	Ask        bool     `json:"ask"`
-	AllowPorts []int    `json:"allow_ports"`
-	Network    string   `json:"network"`
+	Agent      string `json:"agent"`
+	Ask        bool   `json:"ask"`
+	AllowPorts []int  `json:"allow_ports"`
+	Network    string `json:"network"`
 }
 
 type intSlice []int
@@ -63,7 +63,7 @@ func main() {
 	}
 
 	// 1. Define command-line flags
-	agentFlag := flag.String("m", "", "Specify the agent to run (claude, codex, agy, copilot)")
+	agentFlag := flag.String("m", "", "Specify the agent to run (claude, codex, agy, copilot, reasonix)")
 	askFlag := flag.Bool("ask", false, "Disable bypass of agent permissions/approvals (ask for permission)")
 	networkFlag := flag.String("network", "", "Network mode: isolated (default) or host")
 	verboseFlag := flag.Bool("v", false, "Enable verbose logging")
@@ -116,7 +116,7 @@ func main() {
 
 	// Validate agent
 	switch selectedAgent {
-	case AgentClaude, AgentCodex, AgentAgy, AgentCopilot:
+	case AgentClaude, AgentCodex, AgentAgy, AgentCopilot, AgentReasonix:
 		// Valid
 	default:
 		fmt.Fprintf(os.Stderr, "Error: Unknown or unsupported agent: %s\n", selectedAgent)
@@ -312,6 +312,14 @@ func autoDetectAgent() Agent {
 			if _, exists := os.LookupEnv(env); exists {
 				return AgentCopilot
 			}
+		}
+
+		// Check 5. Reasonix
+		if fileExists(filepath.Join(home, ".reasonix")) {
+			return AgentReasonix
+		}
+		if _, exists := os.LookupEnv("DEEPSEEK_API_KEY"); exists {
+			return AgentReasonix
 		}
 	}
 
