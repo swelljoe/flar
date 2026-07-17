@@ -130,6 +130,24 @@ func PrepareConfigDir(agent Agent, absProjectDir string) (string, error) {
 				return "", err
 			}
 		}
+
+	case AgentKimi:
+		srcKimi := filepath.Join(home, ".kimi-code")
+		if _, err := os.Stat(srcKimi); err == nil {
+			destKimi := filepath.Join(tempDir, ".kimi-code")
+			// Kimi's session state is global on disk and mixes every project,
+			// so it is supplied at run time by a project-scoped shadow home
+			// (see prepareKimiStore); copying it here would leak other
+			// projects' history. Its live OAuth dirs are skipped too and
+			// bound from the host at run time so flar never persists a stale
+			// credential snapshot. bin/ (the kimi executable itself) and
+			// updates/ are skipped as well: the real binary is bind-mounted
+			// read-only at run time.
+			if err := CopyDirExcept(srcKimi, destKimi, kimiSkipCopy); err != nil {
+				os.RemoveAll(tempDir)
+				return "", err
+			}
+		}
 	}
 
 	return tempDir, nil

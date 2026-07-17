@@ -2,7 +2,7 @@
 
 FLAR is the Fast Light Agent Restrictor. It runs on rocks called gars.
 
-It is a simple, lightweight CLI tool in Go to run coding agent CLIs (like Claude Code, Antigravity, Codex, Copilot and Reasonix) safely inside isolated [Bubblewrap (`bwrap`) sandboxes](https://github.com/containers/bubblewrap).
+It is a simple, lightweight CLI tool in Go to run coding agent CLIs (like Claude Code, Antigravity, Codex, Copilot, Reasonix and Kimi Code) safely inside isolated [Bubblewrap (`bwrap`) sandboxes](https://github.com/containers/bubblewrap).
 
 ![Antigravity CLI riding in a flar](/assets/agy-in-a-flar.png)
 
@@ -20,7 +20,7 @@ Bubblewrap is extremely well-tested, and actively maintained. It is used by Flat
   - **Isolated Mode (Default)**: The network namespace is unshared. Internet access is tunneled through a host-side HTTP/HTTPS proxy that performs DNS lookup on the host and filters out traffic to local/loopback IP addresses.
   - **Port Forwarding**: Selectively expose local services (e.g. databases, llama.cpp models) into the sandbox by mapping specific ports to the host's `localhost`.
   - **Host Mode**: Option to share the host's network namespace for unconstrained access.
-- **Dangerous Bypass Options**: Automatically injects flags (like `--dangerously-skip-permissions` for Claude/`agy` or `--dangerously-bypass-approvals-and-sandbox` for Codex) so agents run without runtime approval interruptions. Can be disabled with `-ask`.
+- **Dangerous Bypass Options**: Automatically injects flags (like `--dangerously-skip-permissions` for Claude/`agy` or `--dangerously-bypass-approvals-and-sandbox` for Codex) so agents run without runtime approval interruptions. Can be disabled with `-ask`. For Kimi Code, `--yolo` is omitted automatically when `-p`/`--prompt` is passed, since `kimi` rejects that combination.
 - **Config Copying**: Automatically copies host credentials (like `~/.claude/`, `~/.codex/`, `~/.gemini/`, or GitHub CLI configurations) to a temporary directory mounted inside the sandbox home directory, leaving host config files untouched.
 - **Session Persistence & Resume**: When reasonably safe (currently Claude Code and Reasonix) conversations started inside a sandbox are written back to the host, so `--resume`/`--continue` works across runs — scoped to the current project so no other project's history enters the sandbox. Otherwise, history is forked on first run of `flar` for a given agent and project. See [Session persistence & resume](#session-persistence--resume).
 - **Keyring Bridging (`agy`)**: The Antigravity CLI stores its OAuth token in the OS keyring rather than a file. `flar` extracts only that one secret and serves it inside the sandbox through a private, in-process Secret Service — so the agent authenticates without exposing the rest of your keyring. See [Credentials](#credentials).
@@ -63,7 +63,7 @@ flar [flags] [path/to/project] [extra agent args/prompts...]
 
 ### Flags
 
-- `-m`: Specify the agent to run (`claude`, `codex`, `agy`, `copilot`, `reasonix`). Defaults to checking available host configurations or environment variables.
+- `-m`: Specify the agent to run (`claude`, `codex`, `agy`, `copilot`, `reasonix`, `kimi`). Defaults to checking available host configurations or environment variables.
 - `-ask`: Do not skip permissions/approvals (forcing the agent to ask for permission).
 - `-network`: Network mode: `isolated` (default) or `host`.
 - `-allow-port`: Allow a specific local TCP port (e.g. `8080`, `11434`) through the isolated network sandbox. Can be specified multiple times.
@@ -88,6 +88,7 @@ Because only a temporary copy of your config is mounted, agents run authenticate
 
 * **Claude**: `~/.claude/` (including `.credentials.json`) **and** `~/.claude.json`, the top-level file holding onboarding state and account identity. Both are required; with only the credentials, Claude treats the sandbox as a fresh install and prompts for login.
 * **Codex / Copilot**: `~/.codex/`, `~/.copilot/`, and the GitHub CLI config.
+* **Kimi Code**: `~/.kimi-code/` — `config.toml`, `tui.toml`, and `device_id`. Kimi stores credentials in files (`storage = "file"`), so no keyring bridge is needed. Unlike the other agents, the credential dirs (`credentials/`, `oauth/`) are **live-bound from the host** rather than copied into flar's persistent shadow home: Kimi's access tokens live only ~15 minutes and the refresh token rotates on every use, so a copied token goes stale almost immediately, and a sandbox-side refresh of a copied token would invalidate the host's login (and vice versa). Live-binding means `kimi login` on the host is picked up immediately, at the cost of the sandbox being able to write to Kimi's own credential files (which hold only its OAuth tokens, readable by an authenticated agent anyway). The `bin/` (the `kimi` executable itself) and `updates/` directories are not copied; the real binary is bind-mounted read-only at run time.
 
 ### Antigravity (`agy`) keyring
 
@@ -137,11 +138,22 @@ The first time `flar` runs `agy` in a project, it seeds that project's scoped st
 
 * **Reasonix**: Just like Claude Code. Reasonix keeps each project history in its own subdirectory directory, so it can be bindmounted in the same way as Claude Code, with the same caveat.
 
+* **Kimi Code**: as with Codex and Copilot, sessions are "forked" on first run in a project by `flar`, and are no longer shared with `kimi` running outside of `flar`.
+
+Kimi Code splits resume state between per-workspace transcript directories (`~/.kimi-code/sessions/<workspace-id>/<session-id>/`, each self-attributing via the `workDir` in its `state.json`) and a global `session_index.jsonl`, which `kimi --continue` / `--session` needs in order to load a session at all. The index mixes every project's sessions (as absolute paths), and `workspaces.json` lists the root of every workspace ever opened, so neither can be bound into the sandbox as-is. Instead, `flar` gives each workspace a shadow Kimi home:
+
+```
+$XDG_STATE_HOME/flar/kimi/<project-slug>/
+```
+
+(falling back to `~/.local/state/flar/kimi/<project-slug>/`). On first use it seeds that home with only the sessions attributed to the current workspace — read from each session's own `state.json` and from the host index, never from session contents — plus a scoped `session_index.jsonl`, this project's prompt-history file (`user-history/<md5(workDir)>.jsonl`), and a `workspaces.json` filtered down to this project. The whole shadow home is then bind-mounted as `~/.kimi-code` (with the host's `credentials/` and `oauth/` live-bound over it, as described in [Credentials](#credentials)), so new sessions persist there and `kimi --continue` can resume only this workspace's sessions.
+
 Consequences to be aware of:
 
 * **Copilot CLI**: as with `agy`, the scoped shadow home becomes a separate per-project world after the initial seed. Sessions you start with Copilot **outside** `flar` are not pulled into `flar` later, and sessions you start **inside** `flar` are saved back to the scoped shadow home rather than the host's global Copilot store.
 * Sessions you start with `agy` **outside** `flar` are (aside from the initial seed) not visible **inside** flar, and vice versa. This is deliberate — flar's `agy` history is a separate, per-project world.
 * Codex follows the same rule: after the one-time seed, wrapped and unwrapped Codex histories are independent.
+* Kimi Code likewise: after the one-time seed, wrapped and unwrapped Kimi histories are independent. Host-side changes to `config.toml` are not picked up after the seed either — delete the project's shadow home under `$XDG_STATE_HOME/flar/kimi/` to re-seed. (Credentials are the exception: they are live-bound, so `kimi login` and token refreshes on either side are seen by both.)
 * A conversation that `agy`'s own indices never attributed to the current workspace is not seeded, by design. The safe default is to withhold it rather than risk exposing another project's data.
 * Agent-owned `.flar/` directories are excluded from config copies for compatibility, and flar-owned state lives under `$XDG_STATE_HOME/flar/` (or `~/.local/state/flar/`), outside agent-managed configuration directories.
 

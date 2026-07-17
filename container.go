@@ -17,6 +17,7 @@ const (
 	AgentAgy      Agent = "agy"
 	AgentCopilot  Agent = "copilot"
 	AgentReasonix Agent = "reasonix"
+	AgentKimi     Agent = "kimi"
 )
 
 // ensureFile creates an empty file (and its parent directories) if it does not
@@ -75,6 +76,8 @@ func RunSandbox(opts RunOpts) error {
 		agentCmd = "copilot"
 	case AgentReasonix:
 		agentCmd = "reasonix"
+	case AgentKimi:
+		agentCmd = "kimi"
 	default:
 		return fmt.Errorf("unknown or unsupported agent: %s", opts.Agent)
 	}
@@ -85,6 +88,13 @@ func RunSandbox(opts RunOpts) error {
 		// Fallback for agy if not in PATH
 		if opts.Agent == AgentAgy {
 			defaultPath := filepath.Join(hostHome, ".local", "bin", "agy")
+			if _, err := os.Stat(defaultPath); err == nil {
+				hostAgentPath = defaultPath
+			}
+		}
+		// Fallback for kimi's default self-managed install location
+		if opts.Agent == AgentKimi && hostAgentPath == "" {
+			defaultPath := filepath.Join(hostHome, ".kimi-code", "bin", "kimi")
 			if _, err := os.Stat(defaultPath); err == nil {
 				hostAgentPath = defaultPath
 			}
@@ -250,6 +260,36 @@ func RunSandbox(opts RunOpts) error {
 					bwrapArgs = append(bwrapArgs, "--bind", hostProj, hostProj)
 				}
 			}
+		case AgentKimi:
+			kimiPath := filepath.Join(opts.TempConfig, ".kimi-code")
+			if _, err := os.Stat(kimiPath); err == nil {
+				// Kimi keeps resume state in global files (session_index.jsonl,
+				// workspaces.json) that mix every project, so flar replaces the
+				// whole home with a project-scoped shadow home seeded once from
+				// the host (see prepareKimiStore). The kimi binary is not in the
+				// store; it is bind-mounted read-only by the generic agent-binary
+				// mount below.
+				store, err := prepareKimiStore(hostHome, absProjectDir, kimiPath)
+				if err != nil {
+					return fmt.Errorf("prepare kimi store: %w", err)
+				}
+				bwrapArgs = append(bwrapArgs, "--bind", store, filepath.Join(hostHome, ".kimi-code"))
+
+				// Kimi's OAuth access tokens live only ~15 minutes and the
+				// refresh token rotates on every use, so a copied credential
+				// goes stale almost immediately, and a sandbox-side refresh of
+				// a copied token would invalidate the host's login (and vice
+				// versa). Live-bind the host's credential dirs over the store's
+				// copies instead: both sides then always see the latest tokens.
+				// Exposure stays limited to Kimi's own OAuth tokens, which an
+				// authenticated agent can read anyway.
+				for _, sub := range []string{"credentials", "oauth"} {
+					hostDir := filepath.Join(hostHome, ".kimi-code", sub)
+					if dirExists(hostDir) {
+						bwrapArgs = append(bwrapArgs, "--bind", hostDir, hostDir)
+					}
+				}
+			}
 		}
 
 		// Git config
@@ -326,6 +366,7 @@ func RunSandbox(opts RunOpts) error {
 		"GH_TOKEN",
 		"COPILOT_GITHUB_TOKEN",
 		"DEEPSEEK_API_KEY",
+		"KIMI_API_KEY",
 	}
 	for _, env := range envVars {
 		if val, exists := os.LookupEnv(env); exists {
@@ -375,6 +416,16 @@ func RunSandbox(opts RunOpts) error {
 	case AgentReasonix:
 		agentArgs = append(agentArgs, "reasonix")
 		if !opts.AskMode {
+			agentArgs = append(agentArgs, "--yolo")
+		}
+	case AgentKimi:
+		// Use the resolved host path: kimi's install dir (~/.kimi-code/bin) is
+		// not necessarily on PATH, but the binary is bind-mounted at exactly
+		// this location inside the sandbox.
+		agentArgs = append(agentArgs, hostAgentPath)
+		// kimi refuses to combine --yolo (or --auto) with --prompt, so skip the
+		// bypass flag for non-interactive runs; -ask forces omission entirely.
+		if !opts.AskMode && !kimiPromptMode(opts.ExtraArgs) {
 			agentArgs = append(agentArgs, "--yolo")
 		}
 	}
