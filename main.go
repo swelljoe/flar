@@ -63,7 +63,7 @@ func main() {
 	}
 
 	// 1. Define command-line flags
-	agentFlag := flag.String("m", "", "Specify the agent to run (claude, codex, agy, copilot, reasonix)")
+	agentFlag := flag.String("m", "", "Specify the agent to run (claude, codex, agy, copilot, reasonix, kimi)")
 	askFlag := flag.Bool("ask", false, "Disable bypass of agent permissions/approvals (ask for permission)")
 	networkFlag := flag.String("network", "", "Network mode: isolated (default) or host")
 	verboseFlag := flag.Bool("v", false, "Enable verbose logging")
@@ -116,7 +116,7 @@ func main() {
 
 	// Validate agent
 	switch selectedAgent {
-	case AgentClaude, AgentCodex, AgentAgy, AgentCopilot, AgentReasonix:
+	case AgentClaude, AgentCodex, AgentAgy, AgentCopilot, AgentReasonix, AgentKimi:
 		// Valid
 	default:
 		fmt.Fprintf(os.Stderr, "Error: Unknown or unsupported agent: %s\n", selectedAgent)
@@ -320,6 +320,14 @@ func autoDetectAgent() Agent {
 		}
 		if _, exists := os.LookupEnv("DEEPSEEK_API_KEY"); exists {
 			return AgentReasonix
+		}
+
+		// Check 6. Kimi
+		if fileExists(filepath.Join(home, ".kimi-code")) {
+			return AgentKimi
+		}
+		if _, exists := os.LookupEnv("KIMI_API_KEY"); exists {
+			return AgentKimi
 		}
 	}
 
