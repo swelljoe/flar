@@ -18,6 +18,8 @@ import (
 //     state that is global on disk and mixes every project. The current
 //     project's share is supplied at run time by the scoped shadow home (see
 //     prepareKimiStore); copying it here would leak other projects' history.
+//   - credentials, oauth: live OAuth tokens. These are bind-mounted directly
+//     from the host at run time so the sandbox never persists a stale snapshot.
 //   - logs, telemetry: global files mixing every project's activity.
 //   - bin: holds the ~150MB kimi executable itself, which the generic
 //     agent-binary mount supplies read-only at run time.
@@ -27,6 +29,8 @@ var kimiSkipCopy = map[string]bool{
 	"session_index.jsonl": true,
 	"user-history":        true,
 	"workspaces.json":     true,
+	"credentials":         true,
+	"oauth":               true,
 	"logs":                true,
 	"telemetry":           true,
 	"bin":                 true,
@@ -71,6 +75,11 @@ func prepareKimiStore(hostHome, absProjectDir, configSrc string) (string, error)
 	}
 	if err := CopyDirExcept(configSrc, store, kimiSkipCopy); err != nil {
 		return "", err
+	}
+	for _, sub := range []string{"credentials", "oauth"} {
+		if err := os.MkdirAll(filepath.Join(store, sub), 0o700); err != nil {
+			return "", err
+		}
 	}
 	if err := seedKimiStore(hostKimi, store, absProjectDir); err != nil {
 		return "", err

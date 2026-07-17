@@ -32,11 +32,12 @@ func TestKimiPromptMode(t *testing.T) {
 	}
 }
 
-// TestKimiConfigIsolation verifies that only the global config and credentials
-// are copied from ~/.kimi-code, and that session state (sessions/,
-// session_index.jsonl, user-history/, workspaces.json), global logs/telemetry,
-// and the self-managed bin/ and updates/ directories are left behind. The
-// current project's sessions are supplied at run time by the shadow home.
+// TestKimiConfigIsolation verifies that only the global config is copied from
+// ~/.kimi-code, and that session state (sessions/, session_index.jsonl,
+// user-history/, workspaces.json), live OAuth state (credentials/, oauth/),
+// global logs/telemetry, and the self-managed bin/ and updates/ directories
+// are left behind. The current project's sessions are supplied at run time by
+// the shadow home, and the OAuth dirs are live-bound from the host.
 func TestKimiConfigIsolation(t *testing.T) {
 	src := t.TempDir()
 	dst := filepath.Join(t.TempDir(), ".kimi-code")
@@ -44,8 +45,9 @@ func TestKimiConfigIsolation(t *testing.T) {
 	// Files that must be copied.
 	writeFile(t, filepath.Join(src, "config.toml"), "# kimi config")
 	writeFile(t, filepath.Join(src, "tui.toml"), "# tui config")
-	writeFile(t, filepath.Join(src, "credentials", "kimi-code.json"), `{"access_token":"tok"}`)
 	writeFile(t, filepath.Join(src, "device_id"), "device-uuid")
+	writeFile(t, filepath.Join(src, "credentials", "kimi-code.json"), `{"access_token":"tok"}`)
+	writeFile(t, filepath.Join(src, "oauth", "refresh-token"), "refresh")
 
 	// Cross-project session data that must NOT leak.
 	writeFile(t, filepath.Join(src, "sessions", "wd_a", "session_a1", "state.json"), `{"workDir":"/a"}`)
@@ -65,14 +67,15 @@ func TestKimiConfigIsolation(t *testing.T) {
 	// Config files must exist.
 	mustExist(t, dst, "config.toml")
 	mustExist(t, dst, "tui.toml")
-	mustExist(t, dst, filepath.Join("credentials", "kimi-code.json"))
 	mustExist(t, dst, "device_id")
 
-	// Session state, logs and the self-managed binary must NOT exist.
+	// Session state, OAuth state, logs and the self-managed binary must NOT exist.
 	mustAbsent(t, dst, "sessions")
 	mustAbsent(t, dst, "session_index.jsonl")
 	mustAbsent(t, dst, "user-history")
 	mustAbsent(t, dst, "workspaces.json")
+	mustAbsent(t, dst, "credentials")
+	mustAbsent(t, dst, "oauth")
 	mustAbsent(t, dst, "logs")
 	mustAbsent(t, dst, "telemetry")
 	mustAbsent(t, dst, "bin")
@@ -142,6 +145,7 @@ func TestPrepareKimiStoreSeedsOnlyCurrentProject(t *testing.T) {
 	configSrc := t.TempDir()
 	writeFile(t, filepath.Join(configSrc, "config.toml"), "# kimi config")
 	writeFile(t, filepath.Join(configSrc, "credentials", "kimi-code.json"), `{"access_token":"tok"}`)
+	writeFile(t, filepath.Join(configSrc, "oauth", "refresh-token"), "refresh")
 
 	store, err := prepareKimiStore(hostHome, projA, configSrc)
 	if err != nil {
@@ -150,7 +154,10 @@ func TestPrepareKimiStoreSeedsOnlyCurrentProject(t *testing.T) {
 
 	// Config is seeded from configSrc.
 	mustExist(t, store, "config.toml")
-	mustExist(t, store, filepath.Join("credentials", "kimi-code.json"))
+	mustExist(t, store, "credentials")
+	mustExist(t, store, "oauth")
+	mustAbsent(t, store, filepath.Join("credentials", "kimi-code.json"))
+	mustAbsent(t, store, filepath.Join("oauth", "refresh-token"))
 	mustExist(t, store, ".seeded")
 
 	// This project's sessions are seeded, including the index-only one; the
@@ -264,6 +271,8 @@ func TestPrepareKimiStoreFreshHost(t *testing.T) {
 		t.Fatalf("prepareKimiStore: %v", err)
 	}
 	mustExist(t, store, "config.toml")
+	mustExist(t, store, "credentials")
+	mustExist(t, store, "oauth")
 	mustExist(t, store, "sessions")
 	mustExist(t, store, "session_index.jsonl")
 	mustExist(t, store, "user-history")
