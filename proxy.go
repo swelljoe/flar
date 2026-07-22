@@ -245,15 +245,34 @@ func (p *HttpProxy) resolveAndCheck(hostname, portStr string) (string, error) {
 	if len(ips) == 0 {
 		return "", fmt.Errorf("cannot resolve %q: no addresses", hostname)
 	}
-	blocked := false
+	// Determine whether we saw any loopback addresses (which may be allowed via
+	// -allow-port) and whether we saw any other blocked ranges (which are never
+	// allowed from the sandbox).
+	hasLoopback := false
+	blockedNonLoopback := false
+	var loopbackIP net.IP
 	for _, ip := range ips {
+		if ip.IsLoopback() {
+			hasLoopback = true
+			// Prefer IPv4 loopback when available (common for host-local services).
+			if loopbackIP == nil || (loopbackIP.To4() == nil && ip.To4() != nil) {
+				loopbackIP = ip
+			}
+			continue
+		}
 		if isLocalOrPrivateIP(ip) {
-			blocked = true
+			blockedNonLoopback = true
 			break
 		}
 	}
-	if blocked && !p.portAllowed(port) {
+	if blockedNonLoopback {
 		return "", fmt.Errorf("access to local/private address %s port %d is blocked inside the sandbox", hostname, port)
+	}
+	if hasLoopback {
+		if !p.portAllowed(port) {
+			return "", fmt.Errorf("access to localhost port %d is blocked inside the sandbox", port)
+		}
+		return net.JoinHostPort(loopbackIP.String(), portStr), nil
 	}
 	return net.JoinHostPort(ips[0].String(), portStr), nil
 }
