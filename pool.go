@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -71,8 +72,8 @@ func preparePoolStore(hostHome, absProjectDir string) (string, error) {
 		if err := seedPoolStore(hostState, store, absProjectDir); err != nil {
 			return "", err
 		}
-		if f, err := os.OpenFile(marker, os.O_CREATE, 0o600); err == nil {
-			f.Close()
+		if err := os.WriteFile(marker, nil, 0o600); err != nil {
+			return "", fmt.Errorf("create pool seed marker: %w", err)
 		}
 	}
 

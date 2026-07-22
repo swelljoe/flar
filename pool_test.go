@@ -273,3 +273,47 @@ func TestPreparePoolStoreSkipsUnattributableSessions(t *testing.T) {
 	mustAbsent(t, store, filepath.Join("trajectories", "trajectory-standalone_"+sessOther+".ndjson"))
 	mustAbsent(t, store, filepath.Join("trajectories", "trajectory-standalone_"+sessBad+".ndjson"))
 }
+
+// TestPreparePoolStoreMarkerErrorPropagated verifies that when the .seeded
+// marker cannot be created (e.g. the store directory is not writable),
+// preparePoolStore returns an error instead of silently succeeding. Without
+// this, a failed marker creation would cause the next run to re-seed and
+// clobber sessions the user continued inside flar.
+func TestPreparePoolStoreMarkerErrorPropagated(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("skipping when running as root: read-only permissions do not apply")
+	}
+
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+
+	hostHome := t.TempDir()
+	absProjectDir := "/home/joe/src/flar"
+	slug := claudeProjectSlug(absProjectDir)
+	store := filepath.Join(flarStateDir(hostHome), "pool", slug)
+
+	// Pre-create the directory structure so MkdirAll inside preparePoolStore
+	// succeeds (it returns nil for existing directories).
+	for _, sub := range []string{"sessions", "trajectories", "pool", filepath.Join("pool", "logs")} {
+		if err := os.MkdirAll(filepath.Join(store, sub), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Make the store directory read-only so the .seeded marker cannot be
+	// created. Restore permissions on cleanup so t.TempDir() can remove it.
+	if err := os.Chmod(store, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(store, 0o700) })
+
+	// The host has no pool state, so seedPoolStore is a no-op and succeeds.
+	// The failure should come from marker creation.
+	_, err := preparePoolStore(hostHome, absProjectDir)
+	if err == nil {
+		t.Fatal("expected error when .seeded marker creation fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "seed marker") {
+		t.Errorf("expected error to mention seed marker, got: %v", err)
+	}
+}
