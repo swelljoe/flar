@@ -21,9 +21,8 @@ const (
 	AgentPool     Agent = "pool"
 )
 
-// passthroughEnvVars is the set of host environment variables that flar
-// forwards into the sandbox via bwrap --setenv. API-key and credential vars
-// are included so agents can authenticate without re-copying secrets.
+// commonEnvVars is the set of non-secret host environment variables that flar
+// forwards into every sandbox via bwrap --setenv.
 //
 // XDG_CONFIG_HOME and XDG_STATE_HOME are included so that pool (which
 // resolves its config and state directories via these variables) looks in the
@@ -31,7 +30,7 @@ const (
 // pool would fall back to the default ~/.config/poolside and
 // ~/.local/state/poolside and miss the bind mounts when the user has a
 // non-default XDG location.
-var passthroughEnvVars = []string{
+var commonEnvVars = []string{
 	"PATH",
 	"TERM",
 	"USER",
@@ -39,16 +38,29 @@ var passthroughEnvVars = []string{
 	"LOGNAME",
 	"XDG_CONFIG_HOME",
 	"XDG_STATE_HOME",
-	"ANTHROPIC_API_KEY",
-	"OPENAI_API_KEY",
-	"GEMINI_API_KEY",
-	"GITHUB_TOKEN",
-	"GH_TOKEN",
-	"COPILOT_GITHUB_TOKEN",
-	"DEEPSEEK_API_KEY",
-	"KIMI_API_KEY",
-	"POOLSIDE_API_KEY",
-	"POOLSIDE_API_URL",
+}
+
+// agentEnvVars maps each agent to the credential environment variables it
+// needs to authenticate inside the sandbox. Only the variables for the agent
+// actually being run are forwarded: flar exists to minimize the blast area of
+// a prompt injection or supply-chain attack, and an agent has no legitimate
+// reason to read another agent's API keys.
+var agentEnvVars = map[Agent][]string{
+	AgentClaude:   {"ANTHROPIC_API_KEY"},
+	AgentCodex:    {"OPENAI_API_KEY"},
+	AgentAgy:      {"GEMINI_API_KEY"},
+	AgentCopilot:  {"GITHUB_TOKEN", "GH_TOKEN", "COPILOT_GITHUB_TOKEN"},
+	AgentReasonix: {"DEEPSEEK_API_KEY"},
+	AgentKimi:     {"KIMI_API_KEY"},
+	AgentPool:     {"POOLSIDE_API_KEY", "POOLSIDE_API_URL"},
+}
+
+// envVarsForAgent returns the host environment variables forwarded into the
+// sandbox for the given agent: the common non-secret set plus only the
+// credential variables that agent needs.
+func envVarsForAgent(agent Agent) []string {
+	vars := append([]string{}, commonEnvVars...)
+	return append(vars, agentEnvVars[agent]...)
 }
 
 // ensureFile creates an empty file (and its parent directories) if it does not
@@ -408,9 +420,10 @@ func RunSandbox(opts RunOpts) error {
 		bwrapArgs = append(bwrapArgs, "--bind", opts.TempNetDir, "/run/flar-net")
 	}
 
-	// Pass environment variables
+	// Pass environment variables: the common non-secret set plus only the
+	// credential variables the selected agent needs.
 	bwrapArgs = append(bwrapArgs, "--setenv", "HOME", hostHome)
-	for _, env := range passthroughEnvVars {
+	for _, env := range envVarsForAgent(opts.Agent) {
 		if val, exists := os.LookupEnv(env); exists {
 			bwrapArgs = append(bwrapArgs, "--setenv", env, val)
 		}
