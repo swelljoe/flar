@@ -21,6 +21,36 @@ const (
 	AgentPool     Agent = "pool"
 )
 
+// passthroughEnvVars is the set of host environment variables that flar
+// forwards into the sandbox via bwrap --setenv. API-key and credential vars
+// are included so agents can authenticate without re-copying secrets.
+//
+// XDG_CONFIG_HOME and XDG_STATE_HOME are included so that pool (which
+// resolves its config and state directories via these variables) looks in the
+// same paths inside the sandbox where flar bind-mounted them. Without them,
+// pool would fall back to the default ~/.config/poolside and
+// ~/.local/state/poolside and miss the bind mounts when the user has a
+// non-default XDG location.
+var passthroughEnvVars = []string{
+	"PATH",
+	"TERM",
+	"USER",
+	"USERNAME",
+	"LOGNAME",
+	"XDG_CONFIG_HOME",
+	"XDG_STATE_HOME",
+	"ANTHROPIC_API_KEY",
+	"OPENAI_API_KEY",
+	"GEMINI_API_KEY",
+	"GITHUB_TOKEN",
+	"GH_TOKEN",
+	"COPILOT_GITHUB_TOKEN",
+	"DEEPSEEK_API_KEY",
+	"KIMI_API_KEY",
+	"POOLSIDE_API_KEY",
+	"POOLSIDE_API_URL",
+}
+
 // ensureFile creates an empty file (and its parent directories) if it does not
 // already exist, returning true if the file exists afterward. Used to guarantee a
 // bind source is present before mounting it.
@@ -380,24 +410,7 @@ func RunSandbox(opts RunOpts) error {
 
 	// Pass environment variables
 	bwrapArgs = append(bwrapArgs, "--setenv", "HOME", hostHome)
-	envVars := []string{
-		"PATH",
-		"TERM",
-		"USER",
-		"USERNAME",
-		"LOGNAME",
-		"ANTHROPIC_API_KEY",
-		"OPENAI_API_KEY",
-		"GEMINI_API_KEY",
-		"GITHUB_TOKEN",
-		"GH_TOKEN",
-		"COPILOT_GITHUB_TOKEN",
-		"DEEPSEEK_API_KEY",
-		"KIMI_API_KEY",
-		"POOLSIDE_API_KEY",
-		"POOLSIDE_API_URL",
-	}
-	for _, env := range envVars {
+	for _, env := range passthroughEnvVars {
 		if val, exists := os.LookupEnv(env); exists {
 			bwrapArgs = append(bwrapArgs, "--setenv", env, val)
 		}
