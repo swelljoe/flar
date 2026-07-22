@@ -331,7 +331,7 @@ func autoDetectAgent() Agent {
 		}
 
 		// Check 7. Pool
-		if fileExists(filepath.Join(home, ".config", "poolside")) {
+		if fileExists(poolConfigDir(home)) {
 			return AgentPool
 		}
 		if _, exists := os.LookupEnv("POOLSIDE_API_KEY"); exists {
