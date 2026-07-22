@@ -239,14 +239,29 @@ func main() {
 }
 
 // loadConfig reads config files from project root or user config dir.
+//
+// A project-level .flar.json travels with the repository, so it must not be
+// able to weaken sandbox isolation: a checked-in config could otherwise turn
+// on host networking or open local ports for anyone who clones the repo and
+// runs flar in it — exactly the supply-chain scenario flar exists to contain.
+// "network" and "allow_ports" are therefore honored only from the user-level
+// global config (or the command line); "agent" and "ask" are safe to take from
+// the project config because they cannot reduce isolation.
 func loadConfig(projectDir string) Config {
 	var config Config
 
 	// 1. Check project local config: <project>/.flar.json
 	localPath := filepath.Join(projectDir, ".flar.json")
 	if fileExists(localPath) {
-		if err := readJSON(localPath, &config); err == nil {
-			return config
+		var local Config
+		if err := readJSON(localPath, &local); err == nil {
+			if local.Network != "" && local.Network != "isolated" {
+				fmt.Fprintf(os.Stderr, "Warning: ignoring network=%q in %s: network mode can only be set in the global config or with -network\n", local.Network, localPath)
+			}
+			if len(local.AllowPorts) > 0 {
+				fmt.Fprintf(os.Stderr, "Warning: ignoring allow_ports in %s: local ports can only be opened from the global config or with -allow-port\n", localPath)
+			}
+			return Config{Agent: local.Agent, Ask: local.Ask}
 		}
 	}
 

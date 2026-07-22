@@ -188,8 +188,10 @@ func RunSandbox(opts RunOpts) error {
 		"--symlink", "usr/lib64", "/lib64",
 	)
 
-	// Bind-mount optional system paths if they exist
-	optPaths := []string{"/opt", "/var", "/etc/resolv.conf", "/etc/hosts", "/etc/ssl", "/etc/pki", "/etc/ca-certificates", "/etc/alternatives", "/etc/passwd", "/etc/group", "/etc/nsswitch.conf"}
+	// Bind-mount optional system paths if they exist. Deliberately NOT /var:
+	// nothing an agent needs lives there, and mounting it would expose host
+	// logs, spool, and other system state to the sandbox for no benefit.
+	optPaths := []string{"/opt", "/etc/resolv.conf", "/etc/hosts", "/etc/ssl", "/etc/pki", "/etc/ca-certificates", "/etc/alternatives", "/etc/passwd", "/etc/group", "/etc/nsswitch.conf"}
 	for _, p := range optPaths {
 		if _, err := os.Stat(p); err == nil {
 			bwrapArgs = append(bwrapArgs, "--ro-bind-try", p, p)
@@ -525,7 +527,7 @@ func RunSandbox(opts RunOpts) error {
 
 	if opts.Verbose {
 		all := append(append([]string{}, bwrapArgs...), commandArgs...)
-		fmt.Printf("Running command: bwrap %s\n", strings.Join(all, " "))
+		fmt.Printf("Running command: bwrap %s\n", strings.Join(redactedArgs(all), " "))
 	}
 
 	// Pass the bwrap options through a pipe via --args instead of on the command
@@ -572,4 +574,36 @@ func encodeBwrapArgs(args []string) []byte {
 		buf = append(buf, 0)
 	}
 	return buf
+}
+
+// verboseVisibleEnvVars are the --setenv variables whose values may appear in
+// verbose output. Anything not listed — API keys, tokens, and any credential
+// var added in the future — is redacted so `flar -v` cannot leak secrets into
+// terminal scrollback or CI logs. The allowlist is deliberately fail-closed:
+// new variables are hidden unless explicitly marked safe here.
+var verboseVisibleEnvVars = map[string]bool{
+	"HOME": true, "PATH": true, "TERM": true, "USER": true, "USERNAME": true,
+	"LOGNAME": true, "XDG_CONFIG_HOME": true, "XDG_STATE_HOME": true,
+	"HTTP_PROXY": true, "HTTPS_PROXY": true, "http_proxy": true, "https_proxy": true,
+	"DBUS_SESSION_BUS_ADDRESS": true, "FLAR_AGY_SECRET_FILE": true,
+}
+
+// redactedArgs returns args with every --setenv value replaced by "<redacted>"
+// unless the variable is in verboseVisibleEnvVars. Used for the verbose command
+// dump, which would otherwise print every forwarded API key in clear text.
+func redactedArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		out = append(out, args[i])
+		if args[i] == "--setenv" && i+2 < len(args) {
+			out = append(out, args[i+1])
+			if verboseVisibleEnvVars[args[i+1]] {
+				out = append(out, args[i+2])
+			} else {
+				out = append(out, "<redacted>")
+			}
+			i += 2
+		}
+	}
+	return out
 }
