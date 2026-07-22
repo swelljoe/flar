@@ -255,7 +255,7 @@ func loadConfig(projectDir string) Config {
 	if fileExists(localPath) {
 		var local Config
 		if err := readJSON(localPath, &local); err == nil {
-			if local.Network != "" && local.Network != "isolated" {
+			if local.Network != "" {
 				fmt.Fprintf(os.Stderr, "Warning: ignoring network=%q in %s: network mode can only be set in the global config or with -network\n", local.Network, localPath)
 			}
 			if len(local.AllowPorts) > 0 {
