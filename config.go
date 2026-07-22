@@ -148,6 +148,22 @@ func PrepareConfigDir(agent Agent, absProjectDir string) (string, error) {
 				return "", err
 			}
 		}
+
+	case AgentPool:
+		srcPool := poolConfigDir(home)
+		if _, err := os.Stat(srcPool); err == nil {
+			destPool := filepath.Join(tempDir, "poolside")
+			// Pool keeps config (credentials, settings, skills) under
+			// ~/.config/poolside and state (sessions, trajectories,
+			// per-project prompt history/logs) under ~/.local/state/poolside.
+			// Only the config is copied here; the state is forked per-project
+			// at run time by preparePoolStore so other projects' sessions and
+			// trajectories never enter the sandbox.
+			if err := CopyDir(srcPool, destPool); err != nil {
+				os.RemoveAll(tempDir)
+				return "", err
+			}
+		}
 	}
 
 	return tempDir, nil

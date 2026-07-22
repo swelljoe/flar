@@ -18,6 +18,7 @@ const (
 	AgentCopilot  Agent = "copilot"
 	AgentReasonix Agent = "reasonix"
 	AgentKimi     Agent = "kimi"
+	AgentPool     Agent = "pool"
 )
 
 // ensureFile creates an empty file (and its parent directories) if it does not
@@ -78,6 +79,8 @@ func RunSandbox(opts RunOpts) error {
 		agentCmd = "reasonix"
 	case AgentKimi:
 		agentCmd = "kimi"
+	case AgentPool:
+		agentCmd = "pool"
 	default:
 		return fmt.Errorf("unknown or unsupported agent: %s", opts.Agent)
 	}
@@ -290,6 +293,30 @@ func RunSandbox(opts RunOpts) error {
 					}
 				}
 			}
+		case AgentPool:
+			// Pool keeps config (credentials, settings, skills) under
+			// ~/.config/poolside and state (sessions, trajectories,
+			// per-project prompt history/logs) under ~/.local/state/poolside.
+			// The config is a temporary copy; the state is a per-project
+			// shadow home forked once from the host so other projects'
+			// sessions and trajectories never enter the sandbox.
+			poolConfigPath := filepath.Join(opts.TempConfig, "poolside")
+			if _, err := os.Stat(poolConfigPath); err == nil {
+				configPath := poolConfigDir(hostHome)
+				bwrapArgs = append(bwrapArgs, "--dir", filepath.Dir(configPath))
+				bwrapArgs = append(bwrapArgs, "--bind", poolConfigPath, configPath)
+			}
+
+			// Prepare and bind the project-scoped shadow state. This is done
+			// regardless of whether the config exists, since the user may
+			// authenticate via POOLSIDE_API_KEY without a config directory.
+			store, err := preparePoolStore(hostHome, absProjectDir)
+			if err != nil {
+				return fmt.Errorf("prepare pool store: %w", err)
+			}
+			statePath := poolStateDir(hostHome)
+			bwrapArgs = append(bwrapArgs, "--dir", filepath.Dir(statePath))
+			bwrapArgs = append(bwrapArgs, "--bind", store, statePath)
 		}
 
 		// Git config
@@ -367,6 +394,8 @@ func RunSandbox(opts RunOpts) error {
 		"COPILOT_GITHUB_TOKEN",
 		"DEEPSEEK_API_KEY",
 		"KIMI_API_KEY",
+		"POOLSIDE_API_KEY",
+		"POOLSIDE_API_URL",
 	}
 	for _, env := range envVars {
 		if val, exists := os.LookupEnv(env); exists {
@@ -428,6 +457,10 @@ func RunSandbox(opts RunOpts) error {
 		if !opts.AskMode && !kimiPromptMode(opts.ExtraArgs) {
 			agentArgs = append(agentArgs, "--yolo")
 		}
+	case AgentPool:
+		agentArgs = append(agentArgs, "pool")
+		// pool has no "dangerously skip permissions" flag; approvals are
+		// governed by the ACP protocol and the user's pool settings.
 	}
 
 	if len(opts.ExtraArgs) > 0 {
