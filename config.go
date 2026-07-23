@@ -182,6 +182,36 @@ func PrepareConfigDir(agent Agent, absProjectDir string) (string, error) {
 				return "", err
 			}
 		}
+
+	case AgentMimo:
+		// mimo's user config lives in ~/.config/mimocode/ (or
+		// $XDG_CONFIG_HOME/mimocode/). Copy it excluding installation
+		// scaffolding (node_modules, package.json).
+		srcMimoCfg := mimoConfigDir(home)
+		if _, err := os.Stat(srcMimoCfg); err == nil {
+			destMimoCfg := filepath.Join(tempDir, "mimocode-config")
+			if err := CopyDirExcept(srcMimoCfg, destMimoCfg, mimoConfigSkipCopy); err != nil {
+				os.RemoveAll(tempDir)
+				return "", err
+			}
+		}
+
+		// mimo's data directory (~/.local/share/mimocode/) contains the global
+		// SQLite database, auth credentials, and other data. The database mixes
+		// every project's sessions and is replaced at run time by a per-project
+		// shadow store (see prepareMimoStore). Memory, logs, and snapshots are
+		// also skipped: memory is live-bound per project, and logs/snapshots
+		// mix all projects. Only auth.json, installation_id, mimo-key-name,
+		// trusted-workspaces.json, builtin_skills/, compose/, and storage/ are
+		// copied.
+		srcMimoData := mimoDataDir(home)
+		if _, err := os.Stat(srcMimoData); err == nil {
+			destMimoData := filepath.Join(tempDir, "mimocode-data")
+			if err := CopyDirExcept(srcMimoData, destMimoData, mimoSkipCopy); err != nil {
+				os.RemoveAll(tempDir)
+				return "", err
+			}
+		}
 	}
 
 	return tempDir, nil

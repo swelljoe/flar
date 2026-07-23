@@ -26,6 +26,7 @@ func unsetAgentEnvs(t *testing.T) {
 		"DASHSCOPE_API_KEY",
 		"BAILIAN_CODING_PLAN_API_KEY",
 		"BAILIAN_TOKEN_PLAN_API_KEY",
+		"XIAOMI_API_KEY",
 	} {
 		old, hadOld := os.LookupEnv(env)
 		if err := os.Unsetenv(env); err != nil {
