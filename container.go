@@ -517,7 +517,10 @@ func RunSandbox(opts RunOpts) error {
 		// pool has no "dangerously skip permissions" flag; approvals are
 		// governed by the ACP protocol and the user's pool settings.
 	case AgentQwen:
-		agentArgs = append(agentArgs, "qwen")
+		// Use the resolved host path: qwen's install dir (~/.local/bin) is
+		// not necessarily on PATH, but the binary is bind-mounted at exactly
+		// this location inside the sandbox.
+		agentArgs = append(agentArgs, hostAgentPath)
 		if !opts.AskMode {
 			agentArgs = append(agentArgs, "--yolo")
 		}
