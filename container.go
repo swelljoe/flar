@@ -20,6 +20,7 @@ const (
 	AgentKimi     Agent = "kimi"
 	AgentPool     Agent = "pool"
 	AgentQwen     Agent = "qwen"
+	AgentMimo     Agent = "mimo"
 )
 
 // commonEnvVars is the set of non-secret host environment variables that flar
@@ -55,6 +56,7 @@ var agentEnvVars = map[Agent][]string{
 	AgentKimi:     {"KIMI_API_KEY"},
 	AgentPool:     {"POOLSIDE_API_KEY", "POOLSIDE_API_URL"},
 	AgentQwen:     {"DASHSCOPE_API_KEY", "BAILIAN_CODING_PLAN_API_KEY", "BAILIAN_TOKEN_PLAN_API_KEY"},
+	AgentMimo:     {"XIAOMI_API_KEY"},
 }
 
 // envVarsForAgent returns the host environment variables forwarded into the
@@ -127,6 +129,8 @@ func RunSandbox(opts RunOpts) error {
 		agentCmd = "pool"
 	case AgentQwen:
 		agentCmd = "qwen"
+	case AgentMimo:
+		agentCmd = "mimo"
 	default:
 		return fmt.Errorf("unknown or unsupported agent: %s", opts.Agent)
 	}
@@ -151,6 +155,13 @@ func RunSandbox(opts RunOpts) error {
 		// Fallback for qwen's default install location
 		if opts.Agent == AgentQwen && hostAgentPath == "" {
 			defaultPath := filepath.Join(hostHome, ".local", "bin", "qwen")
+			if _, err := os.Stat(defaultPath); err == nil {
+				hostAgentPath = defaultPath
+			}
+		}
+		// Fallback for mimo's default install location (~/.mimocode/bin/mimo)
+		if opts.Agent == AgentMimo && hostAgentPath == "" {
+			defaultPath := filepath.Join(hostHome, ".mimocode", "bin", "mimo")
 			if _, err := os.Stat(defaultPath); err == nil {
 				hostAgentPath = defaultPath
 			}
@@ -388,6 +399,39 @@ func RunSandbox(opts RunOpts) error {
 					bwrapArgs = append(bwrapArgs, "--bind", hostProj, hostProj)
 				}
 			}
+		case AgentMimo:
+			// mimo's config dir (~/.config/mimocode/) holds user settings; the
+			// temp copy was prepared by PrepareConfigDir.
+			mimoCfgPath := filepath.Join(opts.TempConfig, "mimocode-config")
+			if _, err := os.Stat(mimoCfgPath); err == nil {
+				cfgDir := mimoConfigDir(hostHome)
+				bwrapArgs = append(bwrapArgs, "--dir", filepath.Dir(cfgDir))
+				bwrapArgs = append(bwrapArgs, "--bind", mimoCfgPath, cfgDir)
+			}
+
+			// mimo keeps all sessions in a single global SQLite database that
+			// mixes every project. flar forks it per project into a shadow home
+			// so other projects' sessions stay invisible (see prepareMimoStore).
+			// The filtered data dir copy (auth.json, skills, etc.) from
+			// PrepareConfigDir is merged into the store on first seed.
+			mimoDataSrc := filepath.Join(opts.TempConfig, "mimocode-data")
+			store, err := prepareMimoStore(hostHome, absProjectDir, mimoDataSrc)
+			if err != nil {
+				return fmt.Errorf("prepare mimo store: %w", err)
+			}
+			mimoData := mimoDataDir(hostHome)
+			bwrapArgs = append(bwrapArgs, "--dir", filepath.Dir(mimoData))
+			bwrapArgs = append(bwrapArgs, "--bind", store, mimoData)
+
+			// Live-bind the host's memory/projects/<uuid>/ directory so memory
+			// written inside the sandbox persists to the host. The project UUID
+			// comes from the shadow database.
+			if projMemDir := mimoProjectMemoryDir(store, absProjectDir); projMemDir != "" {
+				hostProjMem := filepath.Join(mimoData, "memory", "projects", filepath.Base(projMemDir))
+				if err := os.MkdirAll(hostProjMem, 0o700); err == nil {
+					bwrapArgs = append(bwrapArgs, "--bind", hostProjMem, hostProjMem)
+				}
+			}
 		}
 
 		// Git config
@@ -524,6 +568,17 @@ func RunSandbox(opts RunOpts) error {
 		if !opts.AskMode {
 			agentArgs = append(agentArgs, "--yolo")
 		}
+	case AgentMimo:
+		// Use the resolved host path: mimo's install dir (~/.mimocode/bin) is
+		// not necessarily on PATH, but the binary is bind-mounted at exactly
+		// this location inside the sandbox.
+		agentArgs = append(agentArgs, hostAgentPath)
+		if !opts.AskMode {
+			agentArgs = append(agentArgs, "--dangerously-skip-permissions")
+		}
+		// mimo needs --trust to skip the workspace trust prompt inside the
+		// sandbox, since the project directory is bind-mounted.
+		agentArgs = append(agentArgs, "--trust")
 	}
 
 	if len(opts.ExtraArgs) > 0 {
