@@ -164,6 +164,24 @@ func PrepareConfigDir(agent Agent, absProjectDir string) (string, error) {
 				return "", err
 			}
 		}
+
+	case AgentQwen:
+		srcQwen := filepath.Join(home, ".qwen")
+		if _, err := os.Stat(srcQwen); err == nil {
+			destQwen := filepath.Join(tempDir, ".qwen")
+			// Qwen already scopes sessions per-project on disk
+			// (~/.qwen/projects/<slug>/), so flar copies only the global
+			// config and secrets, then live-binds the current project's
+			// directory at run time — the same pattern used for Claude and
+			// Reasonix. projects/, tmp/, and usage/ are deliberately skipped:
+			// the current project's sessions are live-bound from the host,
+			// and copying them here would expose every other project's
+			// session history.
+			if err := CopyDirExcept(srcQwen, destQwen, qwenSkipCopy); err != nil {
+				os.RemoveAll(tempDir)
+				return "", err
+			}
+		}
 	}
 
 	return tempDir, nil
@@ -327,6 +345,19 @@ var copilotSkipCopy = map[string]bool{
 var reasonixSkipCopy = map[string]bool{
 	"projects": true,
 	"sessions": true,
+}
+
+// qwenSkipCopy lists paths under ~/.qwen (relative to it) that flar does NOT
+// copy into the sandbox config. Qwen already scopes sessions per-project on
+// disk (~/.qwen/projects/<slug>/), so the current project's directory is
+// live-bound at run time — the same pattern used for Claude and Reasonix.
+// Copying projects/ here would leak other projects' history into the sandbox.
+// tmp/ holds per-project-hash runtime state and usage/ tracks global token
+// consumption; neither is needed inside the sandbox.
+var qwenSkipCopy = map[string]bool{
+	"projects": true,
+	"tmp":      true,
+	"usage":    true,
 }
 
 // CopyDirExcept recursively copies src to dst, skipping any entry whose path

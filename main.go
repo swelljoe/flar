@@ -63,7 +63,7 @@ func main() {
 	}
 
 	// 1. Define command-line flags
-	agentFlag := flag.String("m", "", "Specify the agent to run (claude, codex, agy, copilot, reasonix, kimi, pool)")
+	agentFlag := flag.String("m", "", "Specify the agent to run (claude, codex, agy, copilot, reasonix, kimi, pool, qwen)")
 	askFlag := flag.Bool("ask", false, "Disable bypass of agent permissions/approvals (ask for permission)")
 	networkFlag := flag.String("network", "", "Network mode: isolated (default) or host")
 	verboseFlag := flag.Bool("v", false, "Enable verbose logging")
@@ -116,7 +116,7 @@ func main() {
 
 	// Validate agent
 	switch selectedAgent {
-	case AgentClaude, AgentCodex, AgentAgy, AgentCopilot, AgentReasonix, AgentKimi, AgentPool:
+	case AgentClaude, AgentCodex, AgentAgy, AgentCopilot, AgentReasonix, AgentKimi, AgentPool, AgentQwen:
 		// Valid
 	default:
 		fmt.Fprintf(os.Stderr, "Error: Unknown or unsupported agent: %s\n", selectedAgent)
@@ -351,6 +351,16 @@ func autoDetectAgent() Agent {
 		}
 		if _, exists := os.LookupEnv("POOLSIDE_API_KEY"); exists {
 			return AgentPool
+		}
+
+		// Check 8. Qwen
+		if fileExists(filepath.Join(home, ".qwen")) {
+			return AgentQwen
+		}
+		for _, env := range []string{"DASHSCOPE_API_KEY", "BAILIAN_CODING_PLAN_API_KEY", "BAILIAN_TOKEN_PLAN_API_KEY"} {
+			if _, exists := os.LookupEnv(env); exists {
+				return AgentQwen
+			}
 		}
 	}
 
