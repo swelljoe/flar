@@ -412,7 +412,10 @@ func RunSandbox(opts RunOpts) error {
 			// mimo keeps all sessions in a single global SQLite database that
 			// mixes every project. flar forks it per project into a shadow home
 			// so other projects' sessions stay invisible (see prepareMimoStore).
-			store, err := prepareMimoStore(hostHome, absProjectDir)
+			// The filtered data dir copy (auth.json, skills, etc.) from
+			// PrepareConfigDir is merged into the store on first seed.
+			mimoDataSrc := filepath.Join(opts.TempConfig, "mimocode-data")
+			store, err := prepareMimoStore(hostHome, absProjectDir, mimoDataSrc)
 			if err != nil {
 				return fmt.Errorf("prepare mimo store: %w", err)
 			}

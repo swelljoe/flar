@@ -65,7 +65,12 @@ func mimoConfigDir(home string) string {
 // ~/.local/share/mimocode inside the sandbox, so sessions created in flar
 // persist and can be resumed with `mimo --continue`, while other projects'
 // sessions stay invisible.
-func prepareMimoStore(hostHome, absProjectDir string) (string, error) {
+//
+// configSrc is the path to the temp directory prepared by PrepareConfigDir
+// containing the filtered mimo data files (auth.json, skills, etc.). These are
+// copied into the store on first seed so mimo can authenticate inside the
+// sandbox. The config source is not re-read after the one-time seed.
+func prepareMimoStore(hostHome, absProjectDir, configSrc string) (string, error) {
 	hostData := mimoDataDir(hostHome)
 	store := filepath.Join(flarStateDir(hostHome), "mimo", claudeProjectSlug(absProjectDir))
 
@@ -78,7 +83,7 @@ func prepareMimoStore(hostHome, absProjectDir string) (string, error) {
 		return store, nil
 	}
 
-	if err := seedMimoStore(hostData, store, absProjectDir); err != nil {
+	if err := seedMimoStore(hostData, store, absProjectDir, configSrc); err != nil {
 		return "", err
 	}
 	if err := os.WriteFile(marker, nil, 0o600); err != nil {
@@ -88,11 +93,21 @@ func prepareMimoStore(hostHome, absProjectDir string) (string, error) {
 }
 
 // seedMimoStore copies this project's existing host sessions into the scoped
-// shadow database, and copies the project's memory directory.
-func seedMimoStore(hostData, store, absProjectDir string) error {
+// shadow database, the project's memory directory, and config files from
+// configSrc (auth.json, skills, etc. prepared by PrepareConfigDir).
+func seedMimoStore(hostData, store, absProjectDir, configSrc string) error {
+	// Copy config files (auth.json, skills, etc.) from the temp config dir
+	// into the store. This must happen before the DB filter so that auth and
+	// other data files are present when mimo first starts in the sandbox.
+	if configSrc != "" {
+		if err := CopyDir(configSrc, store); err != nil {
+			return err
+		}
+	}
+
 	hostDB := filepath.Join(hostData, "mimocode.db")
 	if !fileExists(hostDB) {
-		// No database on the host; create an empty one so mimo can initialize.
+		// No database on the host; mimo will create a fresh one on first run.
 		return nil
 	}
 
@@ -103,11 +118,9 @@ func seedMimoStore(hostData, store, absProjectDir string) error {
 	// Copy this project's memory directory into the store. mimo stores
 	// project memory at memory/projects/<uuid>/; the UUID comes from the
 	// project table. Session memory (memory/sessions/<id>/) is copied for
-	// sessions belonging to this project.
-	if err := seedMimoMemory(hostData, store, absProjectDir); err != nil {
-		// Best-effort: memory is not required for basic operation.
-		_ = err
-	}
+	// sessions belonging to this project. Best-effort: memory is not
+	// required for basic operation.
+	seedMimoMemory(hostData, store, absProjectDir)
 
 	return nil
 }

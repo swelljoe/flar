@@ -431,7 +431,7 @@ func TestPrepareMimoStoreSeedsOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store, err := prepareMimoStore(hostHome, projA)
+	store, err := prepareMimoStore(hostHome, projA, "")
 	if err != nil {
 		t.Fatalf("prepareMimoStore: %v", err)
 	}
@@ -470,7 +470,7 @@ func TestPrepareMimoStoreSeedsOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store2, err := prepareMimoStore(hostHome, projA)
+	store2, err := prepareMimoStore(hostHome, projA, "")
 	if err != nil || store2 != store {
 		t.Fatalf("second prepare = %q, %v; want %q", store2, err, store)
 	}
@@ -544,12 +544,62 @@ func TestPrepareMimoStoreNoDatabase(t *testing.T) {
 	hostHome := t.TempDir()
 	// Don't create any mimo data directory.
 
-	store, err := prepareMimoStore(hostHome, "/home/joe/src/flar")
+	store, err := prepareMimoStore(hostHome, "/home/joe/src/flar", "")
 	if err != nil {
 		t.Fatalf("prepareMimoStore: %v", err)
 	}
 	mustExist(t, store, ".seeded")
 	mustAbsent(t, store, "mimocode.db")
+}
+
+// TestPrepareMimoStoreMergesConfigSrc verifies that auth.json and other config
+// files from the PrepareConfigDir temp copy are merged into the shadow store
+// on first seed. Without this, mimo would start inside the sandbox without its
+// credentials.
+func TestPrepareMimoStoreMergesConfigSrc(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", "")
+	hostHome := t.TempDir()
+
+	// Create a config source directory simulating what PrepareConfigDir produces.
+	configSrc := t.TempDir()
+	writeFile(t, filepath.Join(configSrc, "auth.json"), `{"provider":{"type":"api","key":"secret"}}`)
+	writeFile(t, filepath.Join(configSrc, "installation_id"), "uuid-1234")
+	writeFile(t, filepath.Join(configSrc, "mimo-key-name"), "key-name")
+	writeFile(t, filepath.Join(configSrc, "builtin_skills", "skill.md"), "skill content")
+
+	store, err := prepareMimoStore(hostHome, "/home/joe/src/flar", configSrc)
+	if err != nil {
+		t.Fatalf("prepareMimoStore: %v", err)
+	}
+
+	// Config files from configSrc must be present in the store.
+	mustExist(t, store, "auth.json")
+	mustExist(t, store, "installation_id")
+	mustExist(t, store, "mimo-key-name")
+	mustExist(t, store, filepath.Join("builtin_skills", "skill.md"))
+
+	// Verify content is preserved.
+	data, err := os.ReadFile(filepath.Join(store, "auth.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "secret") {
+		t.Errorf("auth.json content not preserved: %s", data)
+	}
+
+	// Second prepare should not re-copy (seed-once).
+	writeFile(t, filepath.Join(configSrc, "auth.json"), `{"changed": true}`)
+	store2, err := prepareMimoStore(hostHome, "/home/joe/src/flar", configSrc)
+	if err != nil || store2 != store {
+		t.Fatalf("second prepare = %q, %v; want %q", store2, err, store)
+	}
+	data, err = os.ReadFile(filepath.Join(store, "auth.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "changed") {
+		t.Errorf("configSrc was re-copied on second prepare (should be seed-once)")
+	}
 }
 
 // TestAutoDetectAgentMimo verifies that mimo is auto-detected when ~/.mimocode
