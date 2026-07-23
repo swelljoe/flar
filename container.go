@@ -19,6 +19,7 @@ const (
 	AgentReasonix Agent = "reasonix"
 	AgentKimi     Agent = "kimi"
 	AgentPool     Agent = "pool"
+	AgentQwen     Agent = "qwen"
 )
 
 // commonEnvVars is the set of non-secret host environment variables that flar
@@ -53,6 +54,7 @@ var agentEnvVars = map[Agent][]string{
 	AgentReasonix: {"DEEPSEEK_API_KEY"},
 	AgentKimi:     {"KIMI_API_KEY"},
 	AgentPool:     {"POOLSIDE_API_KEY", "POOLSIDE_API_URL"},
+	AgentQwen:     {"DASHSCOPE_API_KEY", "BAILIAN_CODING_PLAN_API_KEY", "BAILIAN_TOKEN_PLAN_API_KEY"},
 }
 
 // envVarsForAgent returns the host environment variables forwarded into the
@@ -123,6 +125,8 @@ func RunSandbox(opts RunOpts) error {
 		agentCmd = "kimi"
 	case AgentPool:
 		agentCmd = "pool"
+	case AgentQwen:
+		agentCmd = "qwen"
 	default:
 		return fmt.Errorf("unknown or unsupported agent: %s", opts.Agent)
 	}
@@ -140,6 +144,13 @@ func RunSandbox(opts RunOpts) error {
 		// Fallback for kimi's default self-managed install location
 		if opts.Agent == AgentKimi && hostAgentPath == "" {
 			defaultPath := filepath.Join(hostHome, ".kimi-code", "bin", "kimi")
+			if _, err := os.Stat(defaultPath); err == nil {
+				hostAgentPath = defaultPath
+			}
+		}
+		// Fallback for qwen's default install location
+		if opts.Agent == AgentQwen && hostAgentPath == "" {
+			defaultPath := filepath.Join(hostHome, ".local", "bin", "qwen")
 			if _, err := os.Stat(defaultPath); err == nil {
 				hostAgentPath = defaultPath
 			}
@@ -361,6 +372,22 @@ func RunSandbox(opts RunOpts) error {
 			statePath := poolStateDir(hostHome)
 			bwrapArgs = append(bwrapArgs, "--dir", filepath.Dir(statePath))
 			bwrapArgs = append(bwrapArgs, "--bind", store, statePath)
+		case AgentQwen:
+			qwenPath := filepath.Join(opts.TempConfig, ".qwen")
+			if _, err := os.Stat(qwenPath); err == nil {
+				bwrapArgs = append(bwrapArgs, "--bind", qwenPath, filepath.Join(hostHome, ".qwen"))
+
+				// Live-bind only THIS project's directory from the host (over
+				// the copied .qwen), so sessions run in the sandbox are written
+				// straight to disk and can be resumed with `qwen --continue` /
+				// `--resume`. Qwen encodes project paths the same way as Claude
+				// — replacing every non-alphanumeric character with '-'.
+				slug := claudeProjectSlug(absProjectDir)
+				hostProj := filepath.Join(hostHome, ".qwen", "projects", slug)
+				if err := os.MkdirAll(hostProj, 0o700); err == nil {
+					bwrapArgs = append(bwrapArgs, "--bind", hostProj, hostProj)
+				}
+			}
 		}
 
 		// Git config
@@ -489,6 +516,11 @@ func RunSandbox(opts RunOpts) error {
 		agentArgs = append(agentArgs, "pool")
 		// pool has no "dangerously skip permissions" flag; approvals are
 		// governed by the ACP protocol and the user's pool settings.
+	case AgentQwen:
+		agentArgs = append(agentArgs, "qwen")
+		if !opts.AskMode {
+			agentArgs = append(agentArgs, "--yolo")
+		}
 	}
 
 	if len(opts.ExtraArgs) > 0 {
