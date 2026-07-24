@@ -28,5 +28,7 @@ go.work.sum
 # env file
 .env
 
-# AI junk
+# AI detritus
 .poolside/
+.qwen/
+.mimocode/
