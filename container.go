@@ -488,6 +488,17 @@ func RunSandbox(opts RunOpts) error {
 		bwrapArgs = append(bwrapArgs, "--ro-bind", realAgentPath, hostAgentPath)
 	}
 
+	// Qwen's ~/.local/bin/qwen is a wrapper script that execs the real
+	// installation at ~/.local/lib/qwen-code/ (node runtime + cli-entry.js).
+	// Mount that directory so the wrapper can find its target inside the sandbox.
+	if opts.Agent == AgentQwen {
+		qwenLibDir := filepath.Join(hostHome, ".local", "lib", "qwen-code")
+		if dirExists(qwenLibDir) {
+			bwrapArgs = append(bwrapArgs, "--dir", filepath.Join(hostHome, ".local", "lib"))
+			bwrapArgs = append(bwrapArgs, "--ro-bind", qwenLibDir, qwenLibDir)
+		}
+	}
+
 	// Mount local network proxy directory if isolated network
 	if opts.Network == "isolated" && opts.TempNetDir != "" {
 		bwrapArgs = append(bwrapArgs, "--bind", opts.TempNetDir, "/run/flar-net")
