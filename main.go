@@ -187,10 +187,6 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to prepare credentials: %v. Running anyway...\n", err)
 	}
-	if tempConfig != "" {
-		defer os.RemoveAll(tempConfig)
-	}
-
 	// 5. Setup host-side network proxies if in isolated network mode
 	var tempNetDir string
 	var proxies []*PortProxy
@@ -202,16 +198,15 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error creating network proxy directory: %v\n", err)
 			os.Exit(1)
 		}
-		defer os.RemoveAll(tempNetDir)
 
 		// Start HTTP/HTTPS Proxy on host
 		httpProxySock := filepath.Join(tempNetDir, "http-proxy.sock")
 		httpProxy, err = StartHttpProxy(httpProxySock, allowPorts)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error starting host HTTP proxy: %v\n", err)
+			os.RemoveAll(tempNetDir)
 			os.Exit(1)
 		}
-		defer httpProxy.Close()
 
 		// Start TCP Port Proxies on host
 		for _, port := range allowPorts {
@@ -222,19 +217,16 @@ func main() {
 				for _, p := range proxies {
 					p.Close()
 				}
+				httpProxy.Close()
+				os.RemoveAll(tempNetDir)
 				os.Exit(1)
 			}
 			proxies = append(proxies, proxy)
 		}
 	}
-	defer func() {
-		for _, p := range proxies {
-			p.Close()
-		}
-	}()
 
 	// 6. Run the Bubblewrap sandbox
-	err = RunSandbox(RunOpts{
+	exitCode, runErr := RunSandbox(RunOpts{
 		ProjectDir:     absProjectDir,
 		TempConfig:     tempConfig,
 		TempNetDir:     tempNetDir,
@@ -247,10 +239,26 @@ func main() {
 		ContainerCache: containerCache,
 	})
 
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error running sandbox: %v\n", err)
+	// 7. Tear down host-side state before exiting: the os.Exit calls below
+	// would skip defers.
+	for _, p := range proxies {
+		p.Close()
+	}
+	if httpProxy != nil {
+		httpProxy.Close()
+	}
+	if tempNetDir != "" {
+		os.RemoveAll(tempNetDir)
+	}
+	if tempConfig != "" {
+		os.RemoveAll(tempConfig)
+	}
+
+	if runErr != nil {
+		fmt.Fprintf(os.Stderr, "Error running sandbox: %v\n", runErr)
 		os.Exit(1)
 	}
+	os.Exit(exitCode)
 }
 
 // loadConfig reads config files from project root or user config dir.

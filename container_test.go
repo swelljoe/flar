@@ -115,6 +115,54 @@ func TestEnvVarsForAgentScopesCredentials(t *testing.T) {
 	}
 }
 
+// TestSandboxAgentScriptReportsStatus verifies the script that runs inside
+// the sandbox reports the agent's exit status on fd 4 instead of exec'ing
+// the agent. bwrap's monitor adopts orphaned sandbox processes (podman's
+// catatonit pause process, flar's own proxies) and waits for them forever,
+// so flar must learn "the agent exited" from the script and tear the
+// sandbox down itself. Anything running in the background must close fd 4
+// so it cannot hold the status pipe open.
+func TestSandboxAgentScriptReportsStatus(t *testing.T) {
+	opts := RunOpts{Network: "isolated", AllowPorts: []int{8080}}
+	script := sandboxAgentScript(opts, "/usr/local/bin/flar", "/home/u/.agy-secret")
+
+	if strings.Contains(script, "exec \"$@\"") {
+		t.Errorf("script execs the agent; its exit would leave flar waiting on bwrap's orphan adoption:\n%s", script)
+	}
+	for _, want := range []string{
+		// The agent runs as a child (not exec'd) in its own group: flar
+		// must learn its exit from the script, and the stop-signal must be
+		// targetable without reaching bwrap's monitor.
+		"setsid \"$@\" 4>&- 5>&- &",
+		"wait $agent_pid",
+		"printf '%s' \"$rc\" >&4",
+		// Control-channel watcher: host signals cannot cross into the
+		// sandbox's user namespace, so flar writes fd 5 and the watcher
+		// signals the agent's group from the inside.
+		"read -r _ <&5",
+		"kill -TERM -- -\"$agent_pid\"",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("script missing %q:\n%s", want, script)
+		}
+	}
+	// Termination signals are trapped, never ignored: a signal ignored by
+	// the script stays ignored across exec, making the agent deaf to it.
+	if strings.Contains(script, "trap ''") {
+		t.Errorf("script ignores signals; the agent would inherit the ignore and miss them:\n%s", script)
+	}
+	if !strings.Contains(script, "' INT TERM HUP") {
+		t.Errorf("script does not trap INT/TERM/HUP to report the agent's status:\n%s", script)
+	}
+	// Every background job closes fd 4 (holding it would block flar's
+	// end-of-agent detection); only the watcher keeps fd 5.
+	for _, line := range strings.Split(script, "\n") {
+		if strings.HasSuffix(line, "&") && !strings.Contains(line, "4>&-") {
+			t.Errorf("background job does not close fd 4 and could hold the status pipe open: %q", line)
+		}
+	}
+}
+
 // containsSequence reports whether seq appears contiguously in args.
 func containsSequence(args []string, seq ...string) bool {
 	for i := 0; i+len(seq) <= len(args); i++ {
@@ -200,10 +248,12 @@ func TestContainerSupportArgsEphemeral(t *testing.T) {
 		}
 	}
 
-	// Without a host policy, a permissive policy.json must be generated.
-	policy, err := os.ReadFile(filepath.Join(etcContainers, "policy.json"))
-	if err != nil || !strings.Contains(string(policy), "insecureAcceptAnything") {
-		t.Errorf("policy.json missing or invalid: %q, %v", policy, err)
+	// When the host ships no policy, flar must NOT generate one: the only
+	// generatable policy is insecureAcceptAnything, which would silently
+	// disable image signature verification. Image pulls fail closed instead,
+	// with a warning from RunSandbox.
+	if fileExists(filepath.Join(etcContainers, "policy.json")) {
+		t.Errorf("flar generated a policy.json; it must refuse to author an accept-anything signature policy and let pulls fail closed")
 	}
 
 	// Empty subuid/subgid force podman's single-mapping path.
