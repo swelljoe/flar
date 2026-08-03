@@ -1006,6 +1006,17 @@ func RunSandbox(opts RunOpts) (int, error) {
 	waitErr := cmd.Wait()
 	werr := <-writeErr
 
+	// A failed args write means bwrap never received the full option list —
+	// whatever it did afterward was not the sandbox flar intended — so no
+	// exit status from it (not even success) may be reported as the
+	// agent's. The usual cause is bwrap dying before draining the pipe
+	// (EPIPE), so include its status; bwrap's own message is on stderr.
+	if werr != nil {
+		if waitErr != nil {
+			return 0, fmt.Errorf("failed to write bwrap args: %w (bwrap: %v)", werr, waitErr)
+		}
+		return 0, fmt.Errorf("failed to write bwrap args: %w", werr)
+	}
 	if waitErr == nil {
 		return 0, nil
 	}
@@ -1017,9 +1028,6 @@ func RunSandbox(opts RunOpts) (int, error) {
 			return 128 + int(ws.Signal()), nil
 		}
 		return exitErr.ExitCode(), nil
-	}
-	if werr != nil {
-		return 0, fmt.Errorf("failed to write bwrap args: %w", werr)
 	}
 	return 0, waitErr
 }
