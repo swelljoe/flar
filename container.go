@@ -1,8 +1,9 @@
 package main
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 // Agent represents the supported AI developer agents.
@@ -217,35 +219,106 @@ ignore_chown_errors = "true"
 	return args, nil
 }
 
+// tiocstiSeccompFilter returns a classic-BPF seccomp program (the raw
+// struct sock_filter sequence bwrap --seccomp expects) that denies exactly
+// one syscall: ioctl(2) with request TIOCSTI (0x5412), which pushes bytes
+// into the terminal's input queue as if the user had typed them.
+//
+// The sandboxed agent now runs in flar's own session and in the terminal's
+// foreground process group — that is what makes it a transparent, fully
+// interactive wrapper — so without this filter a compromised agent could
+// inject keystrokes into the terminal and have them executed by the user's
+// shell outside the sandbox (bubblewrap's documented CVE-2017-5226
+// warning). Nothing a TUI legitimately does needs TIOCSTI, so denying it
+// costs nothing interactively.
+//
+// The filter is arch-checked so it is safe everywhere, and denies TIOCSTI
+// where the ioctl syscall number is known (x86_64: 16, aarch64: 29). On any
+// other architecture it allows everything, so the sandbox behaves exactly
+// like flar without the filter rather than risking a too-broad denial.
+//
+// bwrap fails closed: if the kernel refuses to load the filter, its
+// prctl(PR_SET_SECCOMP) fails and bwrap dies before the sandbox starts.
+func tiocstiSeccompFilter() []byte {
+	// Classic BPF (struct sock_filter): code | jt | jf | k, 8 bytes each.
+	//   BPF_LD|BPF_W|BPF_ABS (0x20): A = 32-bit word at seccomp_data offset k
+	//   BPF_JMP|BPF_JEQ|BPF_K (0x15): if A == k jump jt (else jf) instructions
+	//   BPF_RET|BPF_K (0x06): return k (SECCOMP_RET_*)
+	// seccomp_data offsets: nr=0, arch=4, args[0]=16, args[1]=24.
+	const (
+		opLD   = 0x20
+		opJEQ  = 0x15
+		opRET  = 0x06
+		retAll = 0x7fff0000     // SECCOMP_RET_ALLOW
+		retErr = 0x00050000 | 1 // SECCOMP_RET_ERRNO | EPERM
+		archX  = 0xc000003e     // AUDIT_ARCH_X86_64
+		archA  = 0xc00000b7     // AUDIT_ARCH_AARCH64
+	)
+	insn := func(code uint16, jt, jf uint8, k uint32) []byte {
+		b := make([]byte, 8)
+		binary.LittleEndian.PutUint16(b[0:2], code)
+		b[2], b[3] = jt, jf
+		binary.LittleEndian.PutUint32(b[4:8], k)
+		return b
+	}
+	// Instruction layout (offsets are pc+1+jt/jf):
+	//   0  ld  arch
+	//   1  jeq x86_64  -> 5
+	//   2  jeq aarch64 -> 3, else -> 10 (allow)
+	//   3  ld  nr
+	//   4  jeq 29 (aarch64 ioctl) -> 7, else -> 10
+	//   5  ld  nr
+	//   6  jeq 16 (x86_64 ioctl) -> 7, else -> 10
+	//   7  ld  args[1] (ioctl request)
+	//   8  jeq TIOCSTI -> 9, else -> 10
+	//   9  ret EPERM
+	//   10 ret ALLOW
+	var f []byte
+	for _, in := range [][]byte{
+		insn(opLD, 0, 0, 4),
+		insn(opJEQ, 3, 0, archX),
+		insn(opJEQ, 0, 7, archA),
+		insn(opLD, 0, 0, 0),
+		insn(opJEQ, 2, 5, 29),
+		insn(opLD, 0, 0, 0),
+		insn(opJEQ, 0, 3, 16),
+		insn(opLD, 0, 0, 24),
+		insn(opJEQ, 0, 1, 0x5412),
+		insn(opRET, 0, 0, retErr),
+		insn(opRET, 0, 0, retAll),
+	} {
+		f = append(f, in...)
+	}
+	return f
+}
+
 // sandboxAgentScript builds the script run inside the sandbox: flar's helper
-// daemons (network proxies, agy's private Secret Service) followed by the
-// agent itself.
+// daemons (network proxies, agy's private Secret Service) started in the
+// background, then the agent exec'd in the foreground.
 //
-// The agent is run as a monitored child rather than exec'd: its exit status
-// is written to fd 4 and the pipe is then closed, so flar learns the agent
-// has exited even when orphaned processes keep the sandbox alive. Without
-// this, bwrap's monitor adopts the orphans and waits for them forever,
-// hanging flar. Two known orphan sources: podman's rootless pause process
-// (catatonit -P), which survives any podman use inside the sandbox, and
-// flar's own helper daemons in isolated network mode. Every daemon closes
-// fd 4 so none of them can hold the pipe open.
+// The exec is what keeps the agent fully interactive: it inherits flar's
+// stdin/stdout/stderr, flar's session (so it owns the controlling terminal
+// and can open /dev/tty), and flar's process group (so tty reads never hit
+// SIGTTIN, and Ctrl-C reaches it straight from the kernel). flar starts
+// bwrap without Setpgid for the same reason.
 //
-// Termination signals cannot be delivered into the sandbox's user namespace
-// from the host — group-directed kills silently skip it, and bwrap does not
-// forward what it receives — so flar signals "stop now" by writing to the
-// control pipe on fd 5. The watcher subshell reads it and sends TERM to the
-// sandbox's whole process group from the inside. The script traps TERM/INT/
-// HUP rather than ignoring them (an ignored signal stays ignored across
-// exec, which would make the agent permanently deaf to it) so it survives
-// long enough to report the agent's resulting exit status on fd 4.
+// Process lifetime needs no machinery here. When the agent exits, the
+// sandbox's pid 1 (bwrap's reaper) immediately reports its exit status to
+// bwrap's host-side monitor over an eventfd, and the monitor exits with
+// that status — it does NOT wait for stray processes still alive in the
+// sandbox. --die-with-parent then SIGKILLs pid 1, collapsing the pid
+// namespace and everything left in it: podman's rootless pause process
+// (catatonit -P), flar's own daemons above, anything the agent left
+// running. So flar just waits for bwrap and reads the agent's exit status
+// from it.
 func sandboxAgentScript(opts RunOpts, absHostFlar, agySecretInSandbox string) string {
 	var s strings.Builder
 	if opts.Network == "isolated" {
 		// Run HTTP/HTTPS proxy inside sandbox using the absolute flar path
-		s.WriteString(fmt.Sprintf("%s --internal-proxy 9090 /run/flar-net/http-proxy.sock 4>&- 5>&- &\n", absHostFlar))
+		s.WriteString(fmt.Sprintf("%s --internal-proxy 9090 /run/flar-net/http-proxy.sock &\n", absHostFlar))
 		// Run custom TCP proxies
 		for _, port := range opts.AllowPorts {
-			s.WriteString(fmt.Sprintf("%s --internal-proxy %d /run/flar-net/port-%d.sock 4>&- 5>&- &\n", absHostFlar, port, port))
+			s.WriteString(fmt.Sprintf("%s --internal-proxy %d /run/flar-net/port-%d.sock &\n", absHostFlar, port, port))
 		}
 		// Wait for the proxies to bind and start listening
 		s.WriteString("sleep 0.2\n")
@@ -254,32 +327,11 @@ func sandboxAgentScript(opts RunOpts, absHostFlar, agySecretInSandbox string) st
 	// Launch the private Secret Service so agy can read its token from a socket
 	// instead of the (absent) host keyring.
 	if agySecretInSandbox != "" {
-		s.WriteString(fmt.Sprintf("%s --internal-secretsvc %s 4>&- 5>&- &\n", absHostFlar, agyBusSocket))
+		s.WriteString(fmt.Sprintf("%s --internal-secretsvc %s &\n", absHostFlar, agyBusSocket))
 		s.WriteString(fmt.Sprintf("for i in $(seq 1 50); do [ -S %s ] && break; sleep 0.02; done\n", agyBusSocket))
 	}
 
-	// The agent runs in its own session/process group (setsid) so it can be
-	// signalled as a tree without touching anything else in the sandbox:
-	// kill -TERM 0 would also reach bwrap's own monitor process — it shares
-	// the sandbox's process group and sits inside the user namespace — and
-	// bwrap tears the whole sandbox down the moment its monitor is
-	// signalled, killing the wrapper before it can report.
-	s.WriteString("setsid \"$@\" 4>&- 5>&- &\n")
-	s.WriteString("agent_pid=$!\n")
-	// Control-channel watcher: a byte from flar on fd 5 means "stop now";
-	// TERM the agent's process group. EOF (flar exited normally) makes read
-	// return non-zero: kill nothing. The wrapper then reports the agent's
-	// resulting exit status on fd 4 via the plain wait below.
-	s.WriteString("( if read -r _ <&5 2>/dev/null; then kill -TERM -- -\"$agent_pid\" 2>/dev/null; fi ) 4>&- &\n")
-	// Safety net in case the wrapper itself is signalled: survive long
-	// enough to report the agent's status. (An ignored signal would stay
-	// ignored across exec and make the agent deaf to it, so trap, never
-	// ignore.)
-	s.WriteString("trap 'if [ -n \"$agent_pid\" ]; then wait \"$agent_pid\"; rc=$?; else rc=130; fi; printf '%s' \"$rc\" >&4 2>/dev/null; exit \"$rc\"' INT TERM HUP\n")
-	s.WriteString("wait $agent_pid\n")
-	s.WriteString("rc=$?\n")
-	s.WriteString("printf '%s' \"$rc\" >&4 2>/dev/null\n")
-	s.WriteString("exit $rc\n")
+	s.WriteString("exec \"$@\"\n")
 	return s.String()
 }
 
@@ -378,8 +430,12 @@ func RunSandbox(opts RunOpts) (int, error) {
 	// Prepare bubblewrap arguments
 	bwrapArgs := []string{
 		"--unshare-all",
-		// If flar itself dies, kill the whole sandbox rather than leaving it
-		// running unattended.
+		// Ties the sandbox's lifetime to bwrap's host-side monitor process:
+		// when the monitor exits (the agent finished) or is killed (flar
+		// died, or signal escalation below), the sandbox's pid 1 is
+		// SIGKILLed and the kernel tears down the whole pid namespace,
+		// including any orphans still alive in it (podman's pause process,
+		// flar's proxy daemons).
 		"--die-with-parent",
 	}
 
@@ -824,6 +880,11 @@ func RunSandbox(opts RunOpts) (int, error) {
 
 	// --chdir is an option, so it travels with the rest through --args below.
 	bwrapArgs = append(bwrapArgs, "--chdir", absProjectDir)
+	// Deny the TIOCSTI ioctl inside the sandbox (see tiocstiSeccompFilter).
+	// The filter program is fed to bwrap on fd 4, created below; bwrap dies
+	// rather than start without the filter, so any filter-load failure fails
+	// the sandbox closed.
+	bwrapArgs = append(bwrapArgs, "--seccomp", "4")
 
 	// The COMMAND and its args must stay on the real command line. bwrap only
 	// consumes options from an --args fd; the trailing command is read from argv.
@@ -846,46 +907,41 @@ func RunSandbox(opts RunOpts) (int, error) {
 	}
 	defer argsReader.Close()
 
-	// The sandbox script reports the agent's exit status through fd 4 and
-	// then exits, closing the pipe. Reading EOF there means "the agent is
-	// done" regardless of orphaned processes still alive in the sandbox
-	// (podman's catatonit pause process, flar's own proxies, daemons the
-	// agent left behind) — orphans get adopted by bwrap's monitor, which
-	// waits for them forever, so flar must not wait for bwrap to exit on
-	// its own.
-	statusReader, statusWriter, err := os.Pipe()
+	// The TIOCSTI-denial filter (see tiocstiSeccompFilter) travels on fd 4:
+	// bwrap reads it to EOF during option parsing, before the sandbox is
+	// unshared. 88 bytes always fit a pipe buffer, so writing here cannot
+	// block.
+	seccompReader, seccompWriter, err := os.Pipe()
 	if err != nil {
-		return 0, fmt.Errorf("failed to create status pipe: %w", err)
+		argsWriter.Close()
+		return 0, fmt.Errorf("failed to create seccomp pipe: %w", err)
 	}
-	// Control channel: writing to it tells the sandbox script to terminate
-	// the agent (see sandboxAgentScript). Host-side signals cannot cross
-	// into the sandbox's user namespace directly.
-	controlReader, controlWriter, err := os.Pipe()
-	if err != nil {
-		statusReader.Close()
-		statusWriter.Close()
-		return 0, fmt.Errorf("failed to create control pipe: %w", err)
+	if _, err := seccompWriter.Write(tiocstiSeccompFilter()); err != nil {
+		argsWriter.Close()
+		seccompReader.Close()
+		seccompWriter.Close()
+		return 0, fmt.Errorf("failed to write seccomp filter: %w", err)
 	}
+	seccompWriter.Close()
 
 	cmd := exec.Command("bwrap", append([]string{"--args", "3"}, commandArgs...)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
-	cmd.ExtraFiles = []*os.File{argsReader, statusWriter, controlReader} // fds 3, 4 and 5 in the child
-	// Run the sandbox in its own process group so flar can kill the entire
-	// tree at once once the agent has reported.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.ExtraFiles = []*os.File{argsReader, seccompReader} // fds 3 and 4 in the child
+	// Deliberately NO Setpgid here: the sandbox must stay in the terminal's
+	// foreground process group, or tty reads from the agent would hit
+	// SIGTTIN (background group) and every interactive TUI would break.
+	// Sharing the foreground group is also what delivers Ctrl-C straight to
+	// the agent with no forwarding: the kernel signals the whole group, the
+	// agent handles it, and bwrap's monitor survives SIGINT.
 
 	if err := cmd.Start(); err != nil {
-		statusReader.Close()
-		statusWriter.Close()
-		controlReader.Close()
-		controlWriter.Close()
+		argsWriter.Close()
+		seccompReader.Close()
 		return 0, fmt.Errorf("failed to start bwrap: %w", err)
 	}
-	// bwrap owns these ends now; flar keeps statusReader and controlWriter.
-	statusWriter.Close()
-	controlReader.Close()
+	seccompReader.Close()
 
 	// Write in a goroutine so an argument blob larger than the pipe buffer can't
 	// deadlock against bwrap reading it.
@@ -898,51 +954,105 @@ func RunSandbox(opts RunOpts) (int, error) {
 		writeErr <- err
 	}()
 
-	// Deliver termination signals over the control pipe: the sandbox's user
-	// namespace is unreachable for host-side signals (group-directed kills
-	// silently skip it), so the script's watcher does the killing from the
-	// inside. A second signal escalates to SIGKILL, which tears the sandbox
-	// down by killing bwrap itself.
+	// Find the agent's pid as the host sees it, for signal forwarding. bwrap
+	// forks twice: cmd.Process is the host-side monitor, its child is the
+	// sandbox's pid 1 (bwrap's reaper), and pid 1's child is the agent. The
+	// lookup runs once, right after start: at that point the agent is pid
+	// 1's only child, whereas later on orphans the agent leaves behind
+	// (podman's pause process) get reparented to pid 1 and would make the
+	// answer ambiguous.
+	var agentPid atomic.Int64
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		init, err := firstChild(cmd.Process.Pid, deadline)
+		if err != nil {
+			return
+		}
+		agent, err := firstChild(init, deadline)
+		if err != nil {
+			return
+		}
+		agentPid.Store(int64(agent))
+	}()
+
+	// Forward termination signals to the agent by pid: kill(2) permission is
+	// uid-based, so the sandbox's namespaces don't block it (only the
+	// sandbox's pid 1 is signal-protected, as every pid-namespace init is).
+	// Ctrl-C needs no forwarding — the agent sits in the terminal's
+	// foreground group and receives it directly — but SIGINT is included so
+	// a signal aimed at flar alone still stops the agent. A second signal,
+	// or a first one before the agent's pid is known, gives up on graceful
+	// shutdown and kills bwrap's monitor, which takes the whole sandbox with
+	// it (--die-with-parent).
 	sigs := make(chan os.Signal, 4)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(sigs)
 	var escalated atomic.Bool
 	go func() {
 		for range sigs {
-			if !escalated.Swap(true) {
-				// A full line: the sandbox-side read blocks until a newline.
-				_, _ = controlWriter.Write([]byte("stop\n"))
-			} else {
-				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			pid := agentPid.Load()
+			if !escalated.Swap(true) && pid != 0 {
+				_ = syscall.Kill(int(pid), syscall.SIGTERM)
+				continue
 			}
+			_ = cmd.Process.Kill()
 		}
 	}()
 
-	// Block until the script reports the agent's exit status and closes fd 4.
-	rcData, _ := io.ReadAll(statusReader)
-	statusReader.Close()
-	controlWriter.Close()
-
-	// Kill whatever the sandbox still holds: orphans keep bwrap alive, so
-	// tear down the whole group instead of waiting for it.
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	// bwrap's monitor exits as soon as the agent does — the sandbox's pid 1
+	// reports the agent's status the moment it is reaped, stray sandbox
+	// processes notwithstanding — and carries the agent's exit status
+	// (128+signal if the agent died to a signal).
 	waitErr := cmd.Wait()
+	werr := <-writeErr
 
-	if werr := <-writeErr; werr != nil && len(rcData) == 0 && waitErr == nil {
+	// A failed args write means bwrap never received the full option list —
+	// whatever it did afterward was not the sandbox flar intended — so no
+	// exit status from it (not even success) may be reported as the
+	// agent's. The usual cause is bwrap dying before draining the pipe
+	// (EPIPE), so include its status; bwrap's own message is on stderr.
+	if werr != nil {
+		if waitErr != nil {
+			return 0, fmt.Errorf("failed to write bwrap args: %w (bwrap: %v)", werr, waitErr)
+		}
 		return 0, fmt.Errorf("failed to write bwrap args: %w", werr)
 	}
-	if rc, perr := strconv.Atoi(strings.TrimSpace(string(rcData))); perr == nil {
-		return rc, nil
+	if waitErr == nil {
+		return 0, nil
 	}
-	// The user forced teardown before the script could report.
-	if escalated.Load() {
-		return 137, nil
+	var exitErr *exec.ExitError
+	if errors.As(waitErr, &exitErr) {
+		// If the monitor itself died to a signal (teardown escalation above,
+		// or a group-directed kill from outside), report it shell-style.
+		if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			return 128 + int(ws.Signal()), nil
+		}
+		return exitErr.ExitCode(), nil
 	}
-	// The script never reported: bwrap failed before the agent ran.
-	if waitErr != nil {
-		return 0, waitErr
+	return 0, waitErr
+}
+
+// firstChild returns the pid of the given process's first child, polling
+// /proc until one appears or the deadline passes. Reading the kernel's
+// children list (/proc/<pid>/task/<pid>/children) is how flar learns the
+// agent's host-visible pid from outside the sandbox. If the process exits
+// first (or /proc lacks the children file), an error is returned and the
+// caller degrades from graceful TERM to hard teardown.
+func firstChild(pid int, deadline time.Time) (int, error) {
+	path := fmt.Sprintf("/proc/%d/task/%d/children", pid, pid)
+	for {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return 0, err
+		}
+		if fields := strings.Fields(string(data)); len(fields) > 0 {
+			return strconv.Atoi(fields[0])
+		}
+		if time.Now().After(deadline) {
+			return 0, fmt.Errorf("process %d has no children", pid)
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
-	return 0, fmt.Errorf("sandbox exited without reporting the agent's exit status")
 }
 
 // encodeBwrapArgs serializes arguments for bwrap's --args: each argument is
