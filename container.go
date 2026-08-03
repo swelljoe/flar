@@ -937,6 +937,7 @@ func RunSandbox(opts RunOpts) (int, error) {
 	// agent handles it, and bwrap's monitor survives SIGINT.
 
 	if err := cmd.Start(); err != nil {
+		argsWriter.Close()
 		seccompReader.Close()
 		return 0, fmt.Errorf("failed to start bwrap: %w", err)
 	}
