@@ -1,6 +1,8 @@
 module swelljoe/flar
 
-go 1.26.4
+go 1.25
+
+toolchain go1.25.12
 
 require modernc.org/sqlite v1.53.0
 

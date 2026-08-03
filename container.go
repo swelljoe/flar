@@ -2,10 +2,15 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
 )
 
 // Agent represents the supported AI developer agents.
@@ -96,18 +101,200 @@ type RunOpts struct {
 	AskMode    bool
 	Verbose    bool
 	ExtraArgs  []string
+	// ContainerCache persists images and layers built or pulled by podman
+	// inside the sandbox under flar's own cache dir (see containerCacheDir).
+	// When false, container storage lives on the sandbox's ephemeral tmpfs
+	// and is discarded on exit.
+	ContainerCache bool
 }
 
-// RunSandbox runs the Bubblewrap sandbox with the specified options.
-func RunSandbox(opts RunOpts) error {
+// containerCacheDir returns the host directory where flar persists container
+// images built or pulled inside the sandbox when container caching is
+// enabled. It is deliberately NOT podman's usual ~/.local/share/containers
+// location, so flar's cache stays separate from any host-side podman use and
+// it is obvious which directory the sandbox may write to. Respects
+// XDG_CACHE_HOME.
+func containerCacheDir(home string) string {
+	if cacheHome := os.Getenv("XDG_CACHE_HOME"); filepath.IsAbs(cacheHome) {
+		return filepath.Join(cacheHome, "flar", "containers")
+	}
+	return filepath.Join(home, ".cache", "flar", "containers")
+}
+
+// containerSupportArgs writes the configuration rootless podman needs into
+// tempConfig and returns the bwrap arguments that mount it into the sandbox.
+// hostEtcContainers is the host's /etc/containers path when it exists, or ""
+// when it does not.
+//
+// bwrap maps only a single UID into the sandbox, so podman runs in "single
+// mapping" mode. The overlay driver needs ignore_chown_errors to unpack
+// layers in that mode, and empty /etc/subuid + /etc/subgid make podman pick
+// single mapping deterministically instead of attempting (and failing) to map
+// subordinate IDs that don't exist in the namespace.
+//
+// podman 5 refuses to pull images without a policy.json. When the host ships
+// /etc/containers it is copied into tempConfig and mounted back read-only,
+// inheriting the host's trust policy (e.g. signature verification) and
+// registry configuration. When the host ships no policy, flar deliberately
+// does NOT generate one — see the note at the policy mount below — and
+// RunSandbox warns that image pulls will not work until the host provides
+// /etc/containers/policy.json.
+//
+// flar's storage.conf is mounted at $HOME/.config/containers/storage.conf
+// rather than /etc/containers: rootless podman overrides graphroot/runroot
+// from system-wide configs with per-user defaults, so only the user-level
+// file is authoritative for the storage location.
+//
+// When containerCache is true, image storage (graphroot) is bind-mounted
+// read-write from containerCacheDir so images survive across runs. Otherwise
+// graphroot points at the sandbox's ephemeral tmpfs home and everything is
+// discarded on exit.
+func containerSupportArgs(tempConfig, hostHome string, uid int, containerCache bool, hostEtcContainers string) ([]string, error) {
+	podmanDir := filepath.Join(tempConfig, "podman")
+	etcContainers := filepath.Join(podmanDir, "etc-containers")
+	if hostEtcContainers != "" {
+		if err := CopyDir(hostEtcContainers, etcContainers); err != nil {
+			return nil, err
+		}
+	} else if err := os.MkdirAll(etcContainers, 0o700); err != nil {
+		return nil, err
+	}
+
+	var args []string
+
+	graphroot := filepath.Join(hostHome, ".local", "share", "containers", "storage")
+	if containerCache {
+		graphroot = containerCacheDir(hostHome)
+		if err := os.MkdirAll(graphroot, 0o700); err != nil {
+			return nil, fmt.Errorf("create container cache dir: %w", err)
+		}
+		args = append(args, "--bind", graphroot, graphroot)
+	}
+
+	storageConf := fmt.Sprintf(`[storage]
+driver = "overlay"
+graphroot = %q
+runroot = %q
+
+[storage.options.overlay]
+ignore_chown_errors = "true"
+`, graphroot, fmt.Sprintf("/run/user/%d/containers", uid))
+	storageConfPath := filepath.Join(podmanDir, "storage.conf")
+	if err := os.WriteFile(storageConfPath, []byte(storageConf), 0o600); err != nil {
+		return nil, err
+	}
+	homeCfgDir := filepath.Join(hostHome, ".config", "containers")
+	args = append(args,
+		"--dir", homeCfgDir,
+		"--ro-bind", storageConfPath, filepath.Join(homeCfgDir, "storage.conf"),
+		// podman's image-copy staging dir defaults to /var/tmp, and the
+		// build-commit path uses that default even though TMPDIR is set;
+		// /var does not exist in the sandbox, so provide it on the tmpfs.
+		"--dir", "/var/tmp",
+	)
+
+	// If the copy has no policy.json (the host ships none), flar does not
+	// generate one: the only generatable policy is insecureAcceptAnything,
+	// which would silently disable image signature verification. A security
+	// tool should not author that posture on the user's behalf, so image
+	// pulls fail closed (with podman's own missing-policy error) until the
+	// host provides a policy. RunSandbox prints the actionable warning.
+	args = append(args, "--ro-bind", etcContainers, "/etc/containers")
+
+	// Empty subuid/subgid: the single-UID mapping can never honor real
+	// ranges, and binding the host's files (which list them) would make
+	// podman attempt the mapping and fail. Empty files make podman pick the
+	// single-mapping path cleanly; with no files at all it logs an error at
+	// every invocation.
+	for _, name := range []string{"subuid", "subgid"} {
+		p := filepath.Join(podmanDir, name)
+		if err := os.WriteFile(p, nil, 0o600); err != nil {
+			return nil, err
+		}
+		args = append(args, "--ro-bind", p, "/etc/"+name)
+	}
+
+	return args, nil
+}
+
+// sandboxAgentScript builds the script run inside the sandbox: flar's helper
+// daemons (network proxies, agy's private Secret Service) followed by the
+// agent itself.
+//
+// The agent is run as a monitored child rather than exec'd: its exit status
+// is written to fd 4 and the pipe is then closed, so flar learns the agent
+// has exited even when orphaned processes keep the sandbox alive. Without
+// this, bwrap's monitor adopts the orphans and waits for them forever,
+// hanging flar. Two known orphan sources: podman's rootless pause process
+// (catatonit -P), which survives any podman use inside the sandbox, and
+// flar's own helper daemons in isolated network mode. Every daemon closes
+// fd 4 so none of them can hold the pipe open.
+//
+// Termination signals cannot be delivered into the sandbox's user namespace
+// from the host — group-directed kills silently skip it, and bwrap does not
+// forward what it receives — so flar signals "stop now" by writing to the
+// control pipe on fd 5. The watcher subshell reads it and sends TERM to the
+// sandbox's whole process group from the inside. The script traps TERM/INT/
+// HUP rather than ignoring them (an ignored signal stays ignored across
+// exec, which would make the agent permanently deaf to it) so it survives
+// long enough to report the agent's resulting exit status on fd 4.
+func sandboxAgentScript(opts RunOpts, absHostFlar, agySecretInSandbox string) string {
+	var s strings.Builder
+	if opts.Network == "isolated" {
+		// Run HTTP/HTTPS proxy inside sandbox using the absolute flar path
+		s.WriteString(fmt.Sprintf("%s --internal-proxy 9090 /run/flar-net/http-proxy.sock 4>&- 5>&- &\n", absHostFlar))
+		// Run custom TCP proxies
+		for _, port := range opts.AllowPorts {
+			s.WriteString(fmt.Sprintf("%s --internal-proxy %d /run/flar-net/port-%d.sock 4>&- 5>&- &\n", absHostFlar, port, port))
+		}
+		// Wait for the proxies to bind and start listening
+		s.WriteString("sleep 0.2\n")
+	}
+
+	// Launch the private Secret Service so agy can read its token from a socket
+	// instead of the (absent) host keyring.
+	if agySecretInSandbox != "" {
+		s.WriteString(fmt.Sprintf("%s --internal-secretsvc %s 4>&- 5>&- &\n", absHostFlar, agyBusSocket))
+		s.WriteString(fmt.Sprintf("for i in $(seq 1 50); do [ -S %s ] && break; sleep 0.02; done\n", agyBusSocket))
+	}
+
+	// The agent runs in its own session/process group (setsid) so it can be
+	// signalled as a tree without touching anything else in the sandbox:
+	// kill -TERM 0 would also reach bwrap's own monitor process — it shares
+	// the sandbox's process group and sits inside the user namespace — and
+	// bwrap tears the whole sandbox down the moment its monitor is
+	// signalled, killing the wrapper before it can report.
+	s.WriteString("setsid \"$@\" 4>&- 5>&- &\n")
+	s.WriteString("agent_pid=$!\n")
+	// Control-channel watcher: a byte from flar on fd 5 means "stop now";
+	// TERM the agent's process group. EOF (flar exited normally) makes read
+	// return non-zero: kill nothing. The wrapper then reports the agent's
+	// resulting exit status on fd 4 via the plain wait below.
+	s.WriteString("( if read -r _ <&5 2>/dev/null; then kill -TERM -- -\"$agent_pid\" 2>/dev/null; fi ) 4>&- &\n")
+	// Safety net in case the wrapper itself is signalled: survive long
+	// enough to report the agent's status. (An ignored signal would stay
+	// ignored across exec and make the agent deaf to it, so trap, never
+	// ignore.)
+	s.WriteString("trap 'if [ -n \"$agent_pid\" ]; then wait \"$agent_pid\"; rc=$?; else rc=130; fi; printf '%s' \"$rc\" >&4 2>/dev/null; exit \"$rc\"' INT TERM HUP\n")
+	s.WriteString("wait $agent_pid\n")
+	s.WriteString("rc=$?\n")
+	s.WriteString("printf '%s' \"$rc\" >&4 2>/dev/null\n")
+	s.WriteString("exit $rc\n")
+	return s.String()
+}
+
+// RunSandbox runs the Bubblewrap sandbox with the specified options. It
+// returns the agent's exit code; a non-nil error means the sandbox itself
+// failed (bwrap could not start, or the agent never reported).
+func RunSandbox(opts RunOpts) (int, error) {
 	hostHome, err := os.UserHomeDir()
 	if err != nil {
-		return fmt.Errorf("failed to get user home directory: %w", err)
+		return 0, fmt.Errorf("failed to get user home directory: %w", err)
 	}
 
 	absProjectDir, err := filepath.Abs(opts.ProjectDir)
 	if err != nil {
-		return fmt.Errorf("failed to resolve absolute project path: %w", err)
+		return 0, fmt.Errorf("failed to resolve absolute project path: %w", err)
 	}
 
 	// Determine agent command to run
@@ -132,7 +319,7 @@ func RunSandbox(opts RunOpts) error {
 	case AgentMimo:
 		agentCmd = "mimo"
 	default:
-		return fmt.Errorf("unknown or unsupported agent: %s", opts.Agent)
+		return 0, fmt.Errorf("unknown or unsupported agent: %s", opts.Agent)
 	}
 
 	// Resolve the agent executable path on the host
@@ -179,7 +366,7 @@ func RunSandbox(opts RunOpts) error {
 			}
 		}
 		if hostAgentPath == "" {
-			return fmt.Errorf("agent binary %q not found on host; please ensure it is in your PATH", agentCmd)
+			return 0, fmt.Errorf("agent binary %q not found on host; please ensure it is in your PATH", agentCmd)
 		}
 	}
 
@@ -191,6 +378,9 @@ func RunSandbox(opts RunOpts) error {
 	// Prepare bubblewrap arguments
 	bwrapArgs := []string{
 		"--unshare-all",
+		// If flar itself dies, kill the whole sandbox rather than leaving it
+		// running unattended.
+		"--die-with-parent",
 	}
 
 	// Share network if requested
@@ -227,6 +417,40 @@ func RunSandbox(opts RunOpts) error {
 		"--tmpfs", "/tmp",
 		"--tmpfs", "/run",
 	)
+
+	// Prepare the sandbox for rootless podman/buildah (image pulls, container
+	// builds, container runs). Empirically required:
+	//   - podman lstats /run/user/<uid> at startup and aborts if absent
+	//   - containers/image uses TMPDIR (default /var/tmp), which doesn't exist here
+	//   - podman hard-errors if /sys/fs/cgroup is missing entirely; a real
+	//     cgroup2 mount is impossible from inside the userns (bwrap drops all
+	//     capabilities before exec), so an empty dir is the achievable state
+	//     and podman degrades gracefully to no-cgroup operation.
+	uid := os.Getuid()
+	runtimeDir := fmt.Sprintf("/run/user/%d", uid)
+	bwrapArgs = append(bwrapArgs,
+		"--dir", runtimeDir,
+		"--setenv", "XDG_RUNTIME_DIR", runtimeDir,
+		"--setenv", "TMPDIR", "/tmp",
+		"--dir", "/sys/fs/cgroup",
+		"--setenv", "PODMAN_IGNORE_CGROUPSV1_WARNING", "1",
+	)
+	// The config files podman 5 additionally requires (policy.json, a
+	// storage.conf tuned for bwrap's single-UID mapping, empty subuid/subgid).
+	if opts.TempConfig != "" {
+		hostEtcContainers := ""
+		if dirExists("/etc/containers") {
+			hostEtcContainers = "/etc/containers"
+		}
+		if !fileExists("/etc/containers/policy.json") {
+			fmt.Fprintf(os.Stderr, "Warning: host has no /etc/containers/policy.json. flar will not generate an accept-anything image signature policy, so container image pulls inside the sandbox will not work until the host provides one (usually shipped by the containers-common package).\n")
+		}
+		supportArgs, err := containerSupportArgs(opts.TempConfig, hostHome, uid, opts.ContainerCache, hostEtcContainers)
+		if err != nil {
+			return 0, fmt.Errorf("prepare container support: %w", err)
+		}
+		bwrapArgs = append(bwrapArgs, supportArgs...)
+	}
 
 	// Bind-mount project directory (read-write)
 	bwrapArgs = append(bwrapArgs, "--bind", absProjectDir, absProjectDir)
@@ -265,7 +489,7 @@ func RunSandbox(opts RunOpts) error {
 			if _, err := os.Stat(codexPath); err == nil {
 				store, err := prepareCodexStore(hostHome, absProjectDir, codexPath)
 				if err != nil {
-					return fmt.Errorf("prepare Codex store: %w", err)
+					return 0, fmt.Errorf("prepare Codex store: %w", err)
 				}
 				bwrapArgs = append(bwrapArgs, "--bind", store, filepath.Join(hostHome, ".codex"))
 			}
@@ -304,7 +528,7 @@ func RunSandbox(opts RunOpts) error {
 			if _, err := os.Stat(copilotPath); err == nil {
 				store, err := prepareCopilotStore(hostHome, absProjectDir, copilotPath)
 				if err != nil {
-					return fmt.Errorf("prepare copilot store: %w", err)
+					return 0, fmt.Errorf("prepare copilot store: %w", err)
 				}
 				bwrapArgs = append(bwrapArgs, "--bind", store, filepath.Join(hostHome, ".copilot"))
 			}
@@ -340,7 +564,7 @@ func RunSandbox(opts RunOpts) error {
 				// mount below.
 				store, err := prepareKimiStore(hostHome, absProjectDir, kimiPath)
 				if err != nil {
-					return fmt.Errorf("prepare kimi store: %w", err)
+					return 0, fmt.Errorf("prepare kimi store: %w", err)
 				}
 				bwrapArgs = append(bwrapArgs, "--bind", store, filepath.Join(hostHome, ".kimi-code"))
 
@@ -378,7 +602,7 @@ func RunSandbox(opts RunOpts) error {
 			// authenticate via POOLSIDE_API_KEY without a config directory.
 			store, err := preparePoolStore(hostHome, absProjectDir)
 			if err != nil {
-				return fmt.Errorf("prepare pool store: %w", err)
+				return 0, fmt.Errorf("prepare pool store: %w", err)
 			}
 			statePath := poolStateDir(hostHome)
 			bwrapArgs = append(bwrapArgs, "--dir", filepath.Dir(statePath))
@@ -417,7 +641,7 @@ func RunSandbox(opts RunOpts) error {
 			mimoDataSrc := filepath.Join(opts.TempConfig, "mimocode-data")
 			store, err := prepareMimoStore(hostHome, absProjectDir, mimoDataSrc)
 			if err != nil {
-				return fmt.Errorf("prepare mimo store: %w", err)
+				return 0, fmt.Errorf("prepare mimo store: %w", err)
 			}
 			mimoData := mimoDataDir(hostHome)
 			bwrapArgs = append(bwrapArgs, "--dir", filepath.Dir(mimoData))
@@ -444,7 +668,7 @@ func RunSandbox(opts RunOpts) error {
 	// Mount the host flar binary inside the sandbox at its exact absolute path
 	hostFlar, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("failed to get flar executable path: %w", err)
+		return 0, fmt.Errorf("failed to get flar executable path: %w", err)
 	}
 	absHostFlar, err := filepath.Abs(hostFlar)
 	if err != nil {
@@ -596,34 +820,14 @@ func RunSandbox(opts RunOpts) error {
 		agentArgs = append(agentArgs, opts.ExtraArgs...)
 	}
 
-	// Prepare script inside sandbox
-	var bashScript strings.Builder
-	if opts.Network == "isolated" {
-		// Run HTTP/HTTPS proxy inside sandbox using the absolute flar path
-		bashScript.WriteString(fmt.Sprintf("%s --internal-proxy 9090 /run/flar-net/http-proxy.sock &\n", absHostFlar))
-		// Run custom TCP proxies
-		for _, port := range opts.AllowPorts {
-			bashScript.WriteString(fmt.Sprintf("%s --internal-proxy %d /run/flar-net/port-%d.sock &\n", absHostFlar, port, port))
-		}
-		// Wait for the proxies to bind and start listening
-		bashScript.WriteString("sleep 0.2\n")
-	}
-
-	// Launch the private Secret Service so agy can read its token from a socket
-	// instead of the (absent) host keyring.
-	if agySecretInSandbox != "" {
-		bashScript.WriteString(fmt.Sprintf("%s --internal-secretsvc %s &\n", absHostFlar, agyBusSocket))
-		bashScript.WriteString(fmt.Sprintf("for i in $(seq 1 50); do [ -S %s ] && break; sleep 0.02; done\n", agyBusSocket))
-	}
-
-	bashScript.WriteString("exec \"$@\"\n")
+	bashScript := sandboxAgentScript(opts, absHostFlar, agySecretInSandbox)
 
 	// --chdir is an option, so it travels with the rest through --args below.
 	bwrapArgs = append(bwrapArgs, "--chdir", absProjectDir)
 
 	// The COMMAND and its args must stay on the real command line. bwrap only
 	// consumes options from an --args fd; the trailing command is read from argv.
-	commandArgs := []string{"/bin/bash", "-c", bashScript.String(), "flar" /* dummy $0 */}
+	commandArgs := []string{"/bin/bash", "-c", bashScript, "flar" /* dummy $0 */}
 	commandArgs = append(commandArgs, agentArgs...)
 
 	if opts.Verbose {
@@ -638,15 +842,50 @@ func RunSandbox(opts RunOpts) error {
 	// agent can read for PID 1. With --args, argv is just "bwrap --args 3 <cmd>".
 	argsReader, argsWriter, err := os.Pipe()
 	if err != nil {
-		return fmt.Errorf("failed to create args pipe: %w", err)
+		return 0, fmt.Errorf("failed to create args pipe: %w", err)
 	}
 	defer argsReader.Close()
+
+	// The sandbox script reports the agent's exit status through fd 4 and
+	// then exits, closing the pipe. Reading EOF there means "the agent is
+	// done" regardless of orphaned processes still alive in the sandbox
+	// (podman's catatonit pause process, flar's own proxies, daemons the
+	// agent left behind) — orphans get adopted by bwrap's monitor, which
+	// waits for them forever, so flar must not wait for bwrap to exit on
+	// its own.
+	statusReader, statusWriter, err := os.Pipe()
+	if err != nil {
+		return 0, fmt.Errorf("failed to create status pipe: %w", err)
+	}
+	// Control channel: writing to it tells the sandbox script to terminate
+	// the agent (see sandboxAgentScript). Host-side signals cannot cross
+	// into the sandbox's user namespace directly.
+	controlReader, controlWriter, err := os.Pipe()
+	if err != nil {
+		statusReader.Close()
+		statusWriter.Close()
+		return 0, fmt.Errorf("failed to create control pipe: %w", err)
+	}
 
 	cmd := exec.Command("bwrap", append([]string{"--args", "3"}, commandArgs...)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
-	cmd.ExtraFiles = []*os.File{argsReader} // becomes fd 3 in the child
+	cmd.ExtraFiles = []*os.File{argsReader, statusWriter, controlReader} // fds 3, 4 and 5 in the child
+	// Run the sandbox in its own process group so flar can kill the entire
+	// tree at once once the agent has reported.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	if err := cmd.Start(); err != nil {
+		statusReader.Close()
+		statusWriter.Close()
+		controlReader.Close()
+		controlWriter.Close()
+		return 0, fmt.Errorf("failed to start bwrap: %w", err)
+	}
+	// bwrap owns these ends now; flar keeps statusReader and controlWriter.
+	statusWriter.Close()
+	controlReader.Close()
 
 	// Write in a goroutine so an argument blob larger than the pipe buffer can't
 	// deadlock against bwrap reading it.
@@ -659,11 +898,51 @@ func RunSandbox(opts RunOpts) error {
 		writeErr <- err
 	}()
 
-	runErr := cmd.Run()
-	if werr := <-writeErr; werr != nil && runErr == nil {
-		return fmt.Errorf("failed to write bwrap args: %w", werr)
+	// Deliver termination signals over the control pipe: the sandbox's user
+	// namespace is unreachable for host-side signals (group-directed kills
+	// silently skip it), so the script's watcher does the killing from the
+	// inside. A second signal escalates to SIGKILL, which tears the sandbox
+	// down by killing bwrap itself.
+	sigs := make(chan os.Signal, 4)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigs)
+	var escalated atomic.Bool
+	go func() {
+		for range sigs {
+			if !escalated.Swap(true) {
+				// A full line: the sandbox-side read blocks until a newline.
+				_, _ = controlWriter.Write([]byte("stop\n"))
+			} else {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			}
+		}
+	}()
+
+	// Block until the script reports the agent's exit status and closes fd 4.
+	rcData, _ := io.ReadAll(statusReader)
+	statusReader.Close()
+	controlWriter.Close()
+
+	// Kill whatever the sandbox still holds: orphans keep bwrap alive, so
+	// tear down the whole group instead of waiting for it.
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	waitErr := cmd.Wait()
+
+	if werr := <-writeErr; werr != nil && len(rcData) == 0 && waitErr == nil {
+		return 0, fmt.Errorf("failed to write bwrap args: %w", werr)
 	}
-	return runErr
+	if rc, perr := strconv.Atoi(strings.TrimSpace(string(rcData))); perr == nil {
+		return rc, nil
+	}
+	// The user forced teardown before the script could report.
+	if escalated.Load() {
+		return 137, nil
+	}
+	// The script never reported: bwrap failed before the agent ran.
+	if waitErr != nil {
+		return 0, waitErr
+	}
+	return 0, fmt.Errorf("sandbox exited without reporting the agent's exit status")
 }
 
 // encodeBwrapArgs serializes arguments for bwrap's --args: each argument is
@@ -687,6 +966,7 @@ var verboseVisibleEnvVars = map[string]bool{
 	"LOGNAME": true, "XDG_CONFIG_HOME": true, "XDG_STATE_HOME": true,
 	"HTTP_PROXY": true, "HTTPS_PROXY": true, "http_proxy": true, "https_proxy": true,
 	"DBUS_SESSION_BUS_ADDRESS": true, "FLAR_AGY_SECRET_FILE": true,
+	"XDG_RUNTIME_DIR": true, "TMPDIR": true, "PODMAN_IGNORE_CGROUPSV1_WARNING": true,
 }
 
 // redactedArgs returns args with every --setenv value replaced by "<redacted>"
