@@ -2,11 +2,18 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
+	"unsafe"
 )
 
 func TestEncodeBwrapArgs(t *testing.T) {
@@ -115,51 +122,151 @@ func TestEnvVarsForAgentScopesCredentials(t *testing.T) {
 	}
 }
 
-// TestSandboxAgentScriptReportsStatus verifies the script that runs inside
-// the sandbox reports the agent's exit status on fd 4 instead of exec'ing
-// the agent. bwrap's monitor adopts orphaned sandbox processes (podman's
-// catatonit pause process, flar's own proxies) and waits for them forever,
-// so flar must learn "the agent exited" from the script and tear the
-// sandbox down itself. Anything running in the background must close fd 4
-// so it cannot hold the status pipe open.
-func TestSandboxAgentScriptReportsStatus(t *testing.T) {
+// TestSandboxAgentScriptExecsAgent verifies the script run inside the
+// sandbox ends by exec'ing the agent in the foreground, with the helper
+// daemons backgrounded before it. The exec is what keeps the agent fully
+// interactive: it inherits flar's stdin, controlling terminal and process
+// group. Nothing cleverer is needed for lifecycle either — bwrap's monitor
+// exits with the agent's status the moment the agent does, even while
+// orphans (podman's pause process, the proxies) are still alive in the
+// sandbox, and --die-with-parent then collapses the namespace.
+func TestSandboxAgentScriptExecsAgent(t *testing.T) {
 	opts := RunOpts{Network: "isolated", AllowPorts: []int{8080}}
 	script := sandboxAgentScript(opts, "/usr/local/bin/flar", "/home/u/.agy-secret")
 
-	if strings.Contains(script, "exec \"$@\"") {
-		t.Errorf("script execs the agent; its exit would leave flar waiting on bwrap's orphan adoption:\n%s", script)
+	if !strings.HasSuffix(strings.TrimSpace(script), "exec \"$@\"") {
+		t.Errorf("script must end by exec'ing the agent in the foreground:\n%s", script)
 	}
-	for _, want := range []string{
-		// The agent runs as a child (not exec'd) in its own group: flar
-		// must learn its exit from the script, and the stop-signal must be
-		// targetable without reaching bwrap's monitor.
-		"setsid \"$@\" 4>&- 5>&- &",
-		"wait $agent_pid",
-		"printf '%s' \"$rc\" >&4",
-		// Control-channel watcher: host signals cannot cross into the
-		// sandbox's user namespace, so flar writes fd 5 and the watcher
-		// signals the agent's group from the inside.
-		"read -r _ <&5",
-		"kill -TERM -- -\"$agent_pid\"",
+	for _, daemon := range []string{
+		"/usr/local/bin/flar --internal-proxy 9090 /run/flar-net/http-proxy.sock &",
+		"/usr/local/bin/flar --internal-proxy 8080 /run/flar-net/port-8080.sock &",
+		"/usr/local/bin/flar --internal-secretsvc",
 	} {
-		if !strings.Contains(script, want) {
-			t.Errorf("script missing %q:\n%s", want, script)
+		if !strings.Contains(script, daemon) {
+			t.Errorf("script missing helper daemon %q:\n%s", daemon, script)
 		}
 	}
-	// Termination signals are trapped, never ignored: a signal ignored by
-	// the script stays ignored across exec, making the agent deaf to it.
-	if strings.Contains(script, "trap ''") {
-		t.Errorf("script ignores signals; the agent would inherit the ignore and miss them:\n%s", script)
-	}
-	if !strings.Contains(script, "' INT TERM HUP") {
-		t.Errorf("script does not trap INT/TERM/HUP to report the agent's status:\n%s", script)
-	}
-	// Every background job closes fd 4 (holding it would block flar's
-	// end-of-agent detection); only the watcher keeps fd 5.
-	for _, line := range strings.Split(script, "\n") {
-		if strings.HasSuffix(line, "&") && !strings.Contains(line, "4>&-") {
-			t.Errorf("background job does not close fd 4 and could hold the status pipe open: %q", line)
+	// Process-lifecycle tricks in this script have broken interactivity
+	// before: backgrounding the agent nulled its stdin (non-interactive
+	// shells redirect async jobs' stdin to /dev/null), setsid dropped the
+	// controlling terminal every TUI needs, and status/control fd juggling
+	// existed only to learn what bwrap already reports. Keep the launch a
+	// plain exec.
+	for _, banned := range []string{"setsid", "0<&0", ">&4", "<&5", "4>&-", "5>&-", "trap", "agent_pid"} {
+		if strings.Contains(script, banned) {
+			t.Errorf("script contains %q; the agent launch must stay a plain exec:\n%s", banned, script)
 		}
+	}
+}
+
+// TestFirstChild verifies the /proc children lookup RunSandbox uses to find
+// the agent's host-visible pid (bwrap monitor → sandbox pid 1 → agent).
+func TestFirstChild(t *testing.T) {
+	// The trailing ":" keeps bash from exec-replacing itself with sleep, so
+	// the tree is bash → sleep and firstChild(bash) must find the sleep.
+	cmd := exec.Command("/bin/bash", "-c", "sleep 30; :")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	pid, err := firstChild(cmd.Process.Pid, time.Now().Add(5*time.Second))
+	if err != nil {
+		t.Fatalf("firstChild: %v", err)
+	}
+	comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if err != nil || strings.TrimSpace(string(comm)) != "sleep" {
+		t.Errorf("firstChild found pid %d (comm %q, err %v), want the sleep child", pid, strings.TrimSpace(string(comm)), err)
+	}
+
+	// A childless process reports an error once the deadline passes; the
+	// caller then degrades from graceful TERM to hard teardown.
+	if _, err := firstChild(pid, time.Now().Add(50*time.Millisecond)); err == nil {
+		t.Errorf("firstChild on a childless process must fail after the deadline")
+	}
+
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	_ = cmd.Process.Kill()
+	_ = cmd.Wait()
+}
+
+// TestTiocstiSeccompFilter verifies the BPF program flar feeds to bwrap
+// --seccomp: it must be a well-formed filter that denies ioctl(TIOCSTI) —
+// the terminal keystroke-injection vector the interactive sandbox would
+// otherwise expose — and nothing else. The runtime half loads the filter
+// into the test process (irreversible, but it only denies TIOCSTI, which
+// nothing else in the binary uses) and probes with a non-tty fd, where the
+// filter firing is distinguishable from the kernel's own fd rejection
+// (EPERM vs ENOTTY).
+func TestTiocstiSeccompFilter(t *testing.T) {
+	f := tiocstiSeccompFilter()
+	if len(f)%8 != 0 {
+		t.Fatalf("filter length %d is not a multiple of struct sock_filter (8 bytes)", len(f))
+	}
+	insn := func(i int) (code uint16, jt, jf uint8, k uint32) {
+		off := i * 8
+		code = binary.LittleEndian.Uint16(f[off : off+2])
+		jt, jf = f[off+2], f[off+3]
+		k = binary.LittleEndian.Uint32(f[off+4 : off+8])
+		return
+	}
+	// Starts by loading the architecture word from seccomp_data.
+	if code, _, _, _ := insn(0); code != 0x20 || binary.LittleEndian.Uint32(f[4:8]) != 4 {
+		t.Fatalf("first instruction is not ld [4] (arch): % x", f[:8])
+	}
+	// A JEQ against TIOCSTI (0x5412) must be present.
+	foundTiocsti := false
+	for i := 0; i < len(f)/8; i++ {
+		if code, _, _, k := insn(i); code == 0x15 && k == 0x5412 {
+			foundTiocsti = true
+		}
+	}
+	if !foundTiocsti {
+		t.Fatalf("filter never tests for TIOCSTI (0x5412): % x", f)
+	}
+	// Ends with the two RETs: EPERM for the denied ioctl, then ALLOW.
+	last := len(f)/8 - 1
+	if code, _, _, k := insn(last); code != 0x06 || k != 0x7fff0000 {
+		t.Fatalf("final instruction is not SECCOMP_RET_ALLOW: % x", f)
+	}
+	if code, _, _, k := insn(last - 1); code != 0x06 || k&0xffff != uint32(syscall.EPERM) {
+		t.Fatalf("second-to-last instruction is not SECCOMP_RET_ERRNO|EPERM: % x", f)
+	}
+
+	switch runtime.GOARCH {
+	case "amd64", "arm64":
+	default:
+		t.Skipf("filter only denies TIOCSTI on amd64/arm64; running on %s", runtime.GOARCH)
+	}
+
+	// Load the filter into this process and prove it fires.
+	filter := make([]byte, len(f))
+	copy(filter, f)
+	prog := struct {
+		length uint16
+		_      uint16
+		filter uintptr
+	}{length: uint16(len(filter) / 8), filter: uintptr(unsafe.Pointer(&filter[0]))}
+	if _, _, errno := syscall.Syscall(syscall.SYS_PRCTL, 38, 1, 0); errno != 0 { // PR_SET_NO_NEW_PRIVS
+		t.Skipf("cannot set no_new_privs: %v", errno)
+	}
+	if _, _, errno := syscall.Syscall(syscall.SYS_PRCTL, 22, 2, uintptr(unsafe.Pointer(&prog))); errno != 0 { // PR_SET_SECCOMP, SECCOMP_MODE_FILTER
+		t.Skipf("kernel refused the filter: %v", errno)
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	// On a non-tty fd the kernel would reject any ioctl with ENOTTY; EPERM
+	// here proves the seccomp filter intercepted TIOCSTI first.
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, r.Fd(), 0x5412, 0); errno != syscall.EPERM {
+		t.Fatalf("ioctl(TIOCSTI) after loading filter: errno %v, want EPERM (filter did not fire)", errno)
+	}
+	// A neighboring ioctl must NOT be denied: it should fall through to the
+	// kernel's own ENOTTY for a pipe fd, proving the filter is narrow.
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, r.Fd(), 0x5413, 0); errno != syscall.ENOTTY {
+		t.Fatalf("ioctl(0x5413) after loading filter: errno %v, want ENOTTY (filter over-broad?)", errno)
 	}
 }
 

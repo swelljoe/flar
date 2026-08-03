@@ -31,8 +31,8 @@ var mimoSkipCopy = map[string]bool{
 // copy. node_modules/ and package*.json are installation scaffolding, not user
 // configuration.
 var mimoConfigSkipCopy = map[string]bool{
-	"node_modules":    true,
-	"package.json":    true,
+	"node_modules":      true,
+	"package.json":      true,
 	"package-lock.json": true,
 }
 
