@@ -10,10 +10,11 @@ import (
 
 // Config represents the settings read from a config file.
 type Config struct {
-	Agent      string `json:"agent"`
-	Ask        bool   `json:"ask"`
-	AllowPorts []int  `json:"allow_ports"`
-	Network    string `json:"network"`
+	Agent          string `json:"agent"`
+	Ask            bool   `json:"ask"`
+	AllowPorts     []int  `json:"allow_ports"`
+	Network        string `json:"network"`
+	ContainerCache bool   `json:"container_cache"`
 }
 
 type intSlice []int
@@ -66,6 +67,7 @@ func main() {
 	agentFlag := flag.String("m", "", "Specify the agent to run (claude, codex, agy, copilot, reasonix, kimi, pool, qwen, mimo)")
 	askFlag := flag.Bool("ask", false, "Disable bypass of agent permissions/approvals (ask for permission)")
 	networkFlag := flag.String("network", "", "Network mode: isolated (default) or host")
+	containerCacheFlag := flag.Bool("container-cache", false, "Persist container images built or pulled by podman inside the sandbox under ~/.cache/flar/containers (default: ephemeral, discarded on exit)")
 	verboseFlag := flag.Bool("v", false, "Enable verbose logging")
 
 	var allowPortsFlag intSlice
@@ -128,6 +130,11 @@ func main() {
 		askMode = true
 	}
 
+	containerCache := *containerCacheFlag
+	if !containerCache && config.ContainerCache {
+		containerCache = true
+	}
+
 	networkMode := *networkFlag
 	if networkMode == "" {
 		if config.Network != "" {
@@ -165,6 +172,13 @@ func main() {
 		fmt.Printf("Network Mode: %s\n", networkMode)
 		if len(allowPorts) > 0 {
 			fmt.Printf("Allowed Local Ports: %v\n", allowPorts)
+		}
+		if containerCache {
+			cacheDir := "~/.cache/flar/containers"
+			if home, err := os.UserHomeDir(); err == nil {
+				cacheDir = containerCacheDir(home)
+			}
+			fmt.Printf("Container Cache: %s\n", cacheDir)
 		}
 	}
 
@@ -221,15 +235,16 @@ func main() {
 
 	// 6. Run the Bubblewrap sandbox
 	err = RunSandbox(RunOpts{
-		ProjectDir: absProjectDir,
-		TempConfig: tempConfig,
-		TempNetDir: tempNetDir,
-		AllowPorts: allowPorts,
-		Agent:      selectedAgent,
-		Network:    networkMode,
-		AskMode:    askMode,
-		Verbose:    *verboseFlag,
-		ExtraArgs:  agentArgs,
+		ProjectDir:     absProjectDir,
+		TempConfig:     tempConfig,
+		TempNetDir:     tempNetDir,
+		AllowPorts:     allowPorts,
+		Agent:          selectedAgent,
+		Network:        networkMode,
+		AskMode:        askMode,
+		Verbose:        *verboseFlag,
+		ExtraArgs:      agentArgs,
+		ContainerCache: containerCache,
 	})
 
 	if err != nil {
@@ -242,11 +257,12 @@ func main() {
 //
 // A project-level .flar.json travels with the repository, so it must not be
 // able to weaken sandbox isolation: a checked-in config could otherwise turn
-// on host networking or open local ports for anyone who clones the repo and
-// runs flar in it — exactly the supply-chain scenario flar exists to contain.
-// "network" and "allow_ports" are therefore honored only from the user-level
-// global config (or the command line); "agent" and "ask" are safe to take from
-// the project config because they cannot reduce isolation.
+// on host networking, open local ports, or add host directories the sandbox
+// may write to, for anyone who clones the repo and runs flar in it — exactly
+// the supply-chain scenario flar exists to contain. "network", "allow_ports",
+// and "container_cache" are therefore honored only from the user-level global
+// config (or the command line); "agent" and "ask" are safe to take from the
+// project config because they cannot reduce isolation.
 func loadConfig(projectDir string) Config {
 	var config Config
 
@@ -260,6 +276,9 @@ func loadConfig(projectDir string) Config {
 			}
 			if len(local.AllowPorts) > 0 {
 				fmt.Fprintf(os.Stderr, "Warning: ignoring allow_ports in %s: local ports can only be opened from the global config or with -allow-port\n", localPath)
+			}
+			if local.ContainerCache {
+				fmt.Fprintf(os.Stderr, "Warning: ignoring container_cache in %s: the container cache can only be enabled from the global config or with -container-cache\n", localPath)
 			}
 			return Config{Agent: local.Agent, Ask: local.Ask}
 		}

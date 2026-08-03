@@ -24,6 +24,7 @@ Bubblewrap is extremely well-tested, and actively maintained. It is used by Flat
 - **Config Copying**: Automatically copies host credentials (like `~/.claude/`, `~/.codex/`, `~/.gemini/`, or GitHub CLI configurations) to a temporary directory mounted inside the sandbox home directory, leaving host config files untouched.
 - **Session Persistence & Resume**: When reasonably safe (currently Claude Code, Reasonix, and Qwen Code) conversations started inside a sandbox are written back to the host, so `--resume`/`--continue` works across runs — scoped to the current project so no other project's history enters the sandbox. Otherwise, history is forked on first run of `flar` for a given agent and project. See [Session persistence & resume](#session-persistence--resume).
 - **Keyring Bridging (`agy`)**: The Antigravity CLI stores its OAuth token in the OS keyring rather than a file. `flar` extracts only that one secret and serves it inside the sandbox through a private, in-process Secret Service — so the agent authenticates without exposing the rest of your keyring. See [Credentials](#credentials).
+- **Container Builds (podman)**: A wrapped agent can use rootless `podman`/`buildah` from the host's `/usr` to pull images, build images, and run containers inside the sandbox. Storage is ephemeral by default; `-container-cache` persists it under flar's own cache directory. See [Container builds (podman)](#container-builds-podman).
 
 ## Build and Install
 
@@ -67,6 +68,7 @@ flar [flags] [path/to/project] [extra agent args/prompts...]
 - `-ask`: Do not skip permissions/approvals (forcing the agent to ask for permission).
 - `-network`: Network mode: `isolated` (default) or `host`.
 - `-allow-port`: Allow a specific local TCP port (e.g. `8080`, `11434`) through the isolated network sandbox. Can be specified multiple times.
+- `-container-cache`: Persist container images built or pulled by podman inside the sandbox under `~/.cache/flar/containers` (respecting `XDG_CACHE_HOME`). Without it, container storage is ephemeral and discarded on exit. See [Container builds (podman)](#container-builds-podman).
 - `-v`: Enable verbose logging.
 
 ### Configuration file (`.flar.json`)
@@ -78,11 +80,12 @@ You can configure options per-project in `<project>/.flar.json` or globally in `
   "agent": "claude",
   "ask": false,
   "network": "isolated",
-  "allow_ports": [5432, 11434]
+  "allow_ports": [5432, 11434],
+  "container_cache": false
 }
 ```
 
-A project-level `.flar.json` travels with the repository, so it cannot weaken sandbox isolation: `network` and `allow_ports` are honored **only** from the global config (or the `-network` / `-allow-port` flags) and are ignored — with a warning — when found in a project config. Otherwise a malicious repo could turn on host networking or open local ports for anyone who clones it and runs `flar`. `agent` and `ask` are safe to set per-project.
+A project-level `.flar.json` travels with the repository, so it cannot weaken sandbox isolation: `network`, `allow_ports`, and `container_cache` are honored **only** from the global config (or the `-network` / `-allow-port` / `-container-cache` flags) and are ignored — with a warning — when found in a project config. Otherwise a malicious repo could turn on host networking, open local ports, or add host directories the sandbox may write to, for anyone who clones it and runs `flar`. `agent` and `ask` are safe to set per-project.
 
 ## Credentials
 
@@ -187,3 +190,13 @@ In **isolated** network mode, the agent's environment has no direct access to ho
 * **Internet Access**: Works automatically for HTTP/HTTPS requests (such as connecting to cloud LLMs like Anthropic or Gemini) using the `HTTP_PROXY` and `HTTPS_PROXY` environment variables.
 * **Localhost Restrictions**: Requests to `localhost`, loopback, private, and link-local IPs via the proxy are blocked (this includes cloud instance metadata endpoints such as `169.254.169.254`).
 * **Exposing Local Services**: To let the agent reach a local database or local LLM (e.g. Ollama on `127.0.0.1:11434`), specify the port using `-allow-port 11434` or the `allow_ports` setting in the **global** config. A secure loopback forwarder will bind `127.0.0.1:11434` inside the sandbox and proxy traffic to the host.
+
+## Container builds (podman)
+
+The sandbox is prepared so a wrapped agent can use rootless `podman`/`buildah` (from the host's `/usr`, no separate installation inside the sandbox) to pull images, build images with `podman build`, and run containers — subject to the constraints of the isolation:
+
+* **Ephemeral by default**: images and layers live on the sandbox's tmpfs and are discarded on exit. Pass `-container-cache` (or set `container_cache: true` in the **global** config) to persist them under `~/.cache/flar/containers` (respecting `XDG_CACHE_HOME`). The cache is deliberately *not* podman's usual `~/.local/share/containers` location, so it never mixes with host-side podman use, and it is obvious which directory the sandbox is allowed to write. Note that image layers are arbitrary content pulled from registries: treat the cache directory accordingly. To delete the cache, use `chmod -R u+w ~/.cache/flar/containers && rm -rf ~/.cache/flar/containers` — rootless podman storage contains read-only layer directories that a plain `rm -rf` cannot remove.
+* **Single-UID mapping**: bwrap maps only your user into the sandbox, so nested containers run in rootless single-mapping mode — file ownership inside images is squashed to your UID. flar supplies the `ignore_chown_errors` overlay setting this mode requires.
+* **Container networking**: `podman run`'s default private (pasta) networking cannot work inside the sandbox — the kernel refuses to open `/dev/net/tun` from an unprivileged user namespace. Use `podman run --network=host` (the container then shares the sandbox's own network mode) or `--network=none`. `podman build` RUN steps are unaffected.
+* **No resource limits**: there is no usable cgroup hierarchy inside the sandbox, so nested containers have no CPU/memory limits — the same as the sandboxed agent itself. If you need a ceiling, wrap the whole `flar` invocation, e.g. `systemd-run --user --scope -p MemoryMax=8G -p TasksMax=2000 flar ...`.
+* **Isolated network mode**: image pulls and RUN-step downloads go through flar's proxy like everything else (`HTTP_PROXY`/`HTTPS_PROXY` are honored by podman/buildah), so only public hosts are reachable. Use `-network host` if builds need direct network access.

@@ -118,12 +118,13 @@ func TestAutoDetectAgentPoolNoConfig(t *testing.T) {
 
 // TestLoadConfigIgnoresProjectIsolationSettings verifies that a project-level
 // .flar.json cannot weaken sandbox isolation: a config checked into an
-// untrusted repository must not be able to turn on host networking or open
-// local ports. Those settings are honored only from the global config or the
-// command line; harmless settings (agent, ask) still apply.
+// untrusted repository must not be able to turn on host networking, open
+// local ports, or add host directories the sandbox may write to. Those
+// settings are honored only from the global config or the command line;
+// harmless settings (agent, ask) still apply.
 func TestLoadConfigIgnoresProjectIsolationSettings(t *testing.T) {
 	dir := t.TempDir()
-	content := `{"agent": "kimi", "ask": true, "network": "host", "allow_ports": [6379, 22]}`
+	content := `{"agent": "kimi", "ask": true, "network": "host", "allow_ports": [6379, 22], "container_cache": true}`
 	if err := os.WriteFile(filepath.Join(dir, ".flar.json"), []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -134,6 +135,9 @@ func TestLoadConfigIgnoresProjectIsolationSettings(t *testing.T) {
 	}
 	if len(cfg.AllowPorts) != 0 {
 		t.Errorf("loadConfig honored project allow_ports=%v", cfg.AllowPorts)
+	}
+	if cfg.ContainerCache {
+		t.Errorf("loadConfig honored project container_cache; the container cache adds a host-writable directory and must come from the global config or CLI")
 	}
 	if cfg.Agent != "kimi" || !cfg.Ask {
 		t.Errorf("loadConfig dropped safe project settings: %+v", cfg)
@@ -149,7 +153,7 @@ func TestLoadConfigGlobalHonorsIsolationSettings(t *testing.T) {
 	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	content := `{"network": "host", "allow_ports": [11434]}`
+	content := `{"network": "host", "allow_ports": [11434], "container_cache": true}`
 	if err := os.WriteFile(filepath.Join(cfgDir, "config.json"), []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -160,5 +164,8 @@ func TestLoadConfigGlobalHonorsIsolationSettings(t *testing.T) {
 	}
 	if len(cfg.AllowPorts) != 1 || cfg.AllowPorts[0] != 11434 {
 		t.Errorf("loadConfig ignored global allow_ports: %+v", cfg)
+	}
+	if !cfg.ContainerCache {
+		t.Errorf("loadConfig ignored global container_cache setting: %+v", cfg)
 	}
 }

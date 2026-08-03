@@ -96,6 +96,117 @@ type RunOpts struct {
 	AskMode    bool
 	Verbose    bool
 	ExtraArgs  []string
+	// ContainerCache persists images and layers built or pulled by podman
+	// inside the sandbox under flar's own cache dir (see containerCacheDir).
+	// When false, container storage lives on the sandbox's ephemeral tmpfs
+	// and is discarded on exit.
+	ContainerCache bool
+}
+
+// containerCacheDir returns the host directory where flar persists container
+// images built or pulled inside the sandbox when container caching is
+// enabled. It is deliberately NOT podman's usual ~/.local/share/containers
+// location, so flar's cache stays separate from any host-side podman use and
+// it is obvious which directory the sandbox may write to. Respects
+// XDG_CACHE_HOME.
+func containerCacheDir(home string) string {
+	if cacheHome := os.Getenv("XDG_CACHE_HOME"); filepath.IsAbs(cacheHome) {
+		return filepath.Join(cacheHome, "flar", "containers")
+	}
+	return filepath.Join(home, ".cache", "flar", "containers")
+}
+
+// containerSupportArgs writes the configuration rootless podman needs into
+// tempConfig and returns the bwrap arguments that mount it into the sandbox.
+// hostEtcContainers is the host's /etc/containers path when it exists, or ""
+// when it does not.
+//
+// bwrap maps only a single UID into the sandbox, so podman runs in "single
+// mapping" mode. The overlay driver needs ignore_chown_errors to unpack
+// layers in that mode, and empty /etc/subuid + /etc/subgid make podman pick
+// single mapping deterministically instead of attempting (and failing) to map
+// subordinate IDs that don't exist in the namespace.
+//
+// podman 5 refuses to pull images without a policy.json. When the host ships
+// /etc/containers it is copied into tempConfig and mounted back read-only,
+// inheriting the host's trust policy (e.g. signature verification) and
+// registry configuration; otherwise a permissive policy is generated.
+//
+// flar's storage.conf is mounted at $HOME/.config/containers/storage.conf
+// rather than /etc/containers: rootless podman overrides graphroot/runroot
+// from system-wide configs with per-user defaults, so only the user-level
+// file is authoritative for the storage location.
+//
+// When containerCache is true, image storage (graphroot) is bind-mounted
+// read-write from containerCacheDir so images survive across runs. Otherwise
+// graphroot points at the sandbox's ephemeral tmpfs home and everything is
+// discarded on exit.
+func containerSupportArgs(tempConfig, hostHome string, uid int, containerCache bool, hostEtcContainers string) ([]string, error) {
+	podmanDir := filepath.Join(tempConfig, "podman")
+	etcContainers := filepath.Join(podmanDir, "etc-containers")
+	if hostEtcContainers != "" {
+		if err := CopyDir(hostEtcContainers, etcContainers); err != nil {
+			return nil, err
+		}
+	} else if err := os.MkdirAll(etcContainers, 0o700); err != nil {
+		return nil, err
+	}
+
+	var args []string
+
+	graphroot := filepath.Join(hostHome, ".local", "share", "containers", "storage")
+	if containerCache {
+		graphroot = containerCacheDir(hostHome)
+		if err := os.MkdirAll(graphroot, 0o700); err != nil {
+			return nil, fmt.Errorf("create container cache dir: %w", err)
+		}
+		args = append(args, "--bind", graphroot, graphroot)
+	}
+
+	storageConf := fmt.Sprintf(`[storage]
+driver = "overlay"
+graphroot = %q
+runroot = %q
+
+[storage.options.overlay]
+ignore_chown_errors = "true"
+`, graphroot, fmt.Sprintf("/run/user/%d/containers", uid))
+	storageConfPath := filepath.Join(podmanDir, "storage.conf")
+	if err := os.WriteFile(storageConfPath, []byte(storageConf), 0o600); err != nil {
+		return nil, err
+	}
+	homeCfgDir := filepath.Join(hostHome, ".config", "containers")
+	args = append(args,
+		"--dir", homeCfgDir,
+		"--ro-bind", storageConfPath, filepath.Join(homeCfgDir, "storage.conf"),
+		// podman's image-copy staging dir defaults to /var/tmp, and the
+		// build-commit path uses that default even though TMPDIR is set;
+		// /var does not exist in the sandbox, so provide it on the tmpfs.
+		"--dir", "/var/tmp",
+	)
+
+	if !fileExists(filepath.Join(etcContainers, "policy.json")) {
+		policy := "{\"default\":[{\"type\":\"insecureAcceptAnything\"}]}\n"
+		if err := os.WriteFile(filepath.Join(etcContainers, "policy.json"), []byte(policy), 0o600); err != nil {
+			return nil, err
+		}
+	}
+	args = append(args, "--ro-bind", etcContainers, "/etc/containers")
+
+	// Empty subuid/subgid: the single-UID mapping can never honor real
+	// ranges, and binding the host's files (which list them) would make
+	// podman attempt the mapping and fail. Empty files make podman pick the
+	// single-mapping path cleanly; with no files at all it logs an error at
+	// every invocation.
+	for _, name := range []string{"subuid", "subgid"} {
+		p := filepath.Join(podmanDir, name)
+		if err := os.WriteFile(p, nil, 0o600); err != nil {
+			return nil, err
+		}
+		args = append(args, "--ro-bind", p, "/etc/"+name)
+	}
+
+	return args, nil
 }
 
 // RunSandbox runs the Bubblewrap sandbox with the specified options.
@@ -227,6 +338,37 @@ func RunSandbox(opts RunOpts) error {
 		"--tmpfs", "/tmp",
 		"--tmpfs", "/run",
 	)
+
+	// Prepare the sandbox for rootless podman/buildah (image pulls, container
+	// builds, container runs). Empirically required:
+	//   - podman lstats /run/user/<uid> at startup and aborts if absent
+	//   - containers/image uses TMPDIR (default /var/tmp), which doesn't exist here
+	//   - podman hard-errors if /sys/fs/cgroup is missing entirely; a real
+	//     cgroup2 mount is impossible from inside the userns (bwrap drops all
+	//     capabilities before exec), so an empty dir is the achievable state
+	//     and podman degrades gracefully to no-cgroup operation.
+	uid := os.Getuid()
+	runtimeDir := fmt.Sprintf("/run/user/%d", uid)
+	bwrapArgs = append(bwrapArgs,
+		"--dir", runtimeDir,
+		"--setenv", "XDG_RUNTIME_DIR", runtimeDir,
+		"--setenv", "TMPDIR", "/tmp",
+		"--dir", "/sys/fs/cgroup",
+		"--setenv", "PODMAN_IGNORE_CGROUPSV1_WARNING", "1",
+	)
+	// The config files podman 5 additionally requires (policy.json, a
+	// storage.conf tuned for bwrap's single-UID mapping, empty subuid/subgid).
+	if opts.TempConfig != "" {
+		hostEtcContainers := ""
+		if dirExists("/etc/containers") {
+			hostEtcContainers = "/etc/containers"
+		}
+		supportArgs, err := containerSupportArgs(opts.TempConfig, hostHome, uid, opts.ContainerCache, hostEtcContainers)
+		if err != nil {
+			return fmt.Errorf("prepare container support: %w", err)
+		}
+		bwrapArgs = append(bwrapArgs, supportArgs...)
+	}
 
 	// Bind-mount project directory (read-write)
 	bwrapArgs = append(bwrapArgs, "--bind", absProjectDir, absProjectDir)
@@ -687,6 +829,7 @@ var verboseVisibleEnvVars = map[string]bool{
 	"LOGNAME": true, "XDG_CONFIG_HOME": true, "XDG_STATE_HOME": true,
 	"HTTP_PROXY": true, "HTTPS_PROXY": true, "http_proxy": true, "https_proxy": true,
 	"DBUS_SESSION_BUS_ADDRESS": true, "FLAR_AGY_SECRET_FILE": true,
+	"XDG_RUNTIME_DIR": true, "TMPDIR": true, "PODMAN_IGNORE_CGROUPSV1_WARNING": true,
 }
 
 // redactedArgs returns args with every --setenv value replaced by "<redacted>"
