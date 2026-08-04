@@ -444,3 +444,115 @@ func TestContainerSupportArgsCache(t *testing.T) {
 		t.Errorf("host storage.conf leaked into flar's:\n%s", content)
 	}
 }
+
+// TestParseOpensslIncludes checks both spellings of the .include directive and
+// that near-misses are not mistaken for one.
+func TestParseOpensslIncludes(t *testing.T) {
+	dir := t.TempDir()
+	conf := filepath.Join(dir, "openssl.cnf")
+	if err := os.WriteFile(conf, []byte(`
+# .include /commented/out
+.include /etc/pki/tls/openssl.d
+.include = /etc/crypto-policies/back-ends/opensslcnf.config
+.include	=	"/quoted/path"
+.include relative.cnf
+.include /with/trailing # comment
+.includes_not_a_directive /nope
+.include $ENV::SOMEWHERE
+[ section ]
+foo = .include /not/a/directive
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := parseOpensslIncludes(conf)
+	want := []string{
+		"/etc/pki/tls/openssl.d",
+		"/etc/crypto-policies/back-ends/opensslcnf.config",
+		"/quoted/path",
+		"relative.cnf",
+		"/with/trailing",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("parseOpensslIncludes = %v, want %v", got, want)
+	}
+
+	if got := parseOpensslIncludes(filepath.Join(dir, "absent.cnf")); got != nil {
+		t.Errorf("parseOpensslIncludes on a missing file = %v, want nil", got)
+	}
+}
+
+// TestOpensslIncludePaths verifies the discovery walk against a synthetic
+// version of Fedora's layout: the master config includes a symlink pointing
+// into a bound tree, and that symlink's own /etc path is what must be mounted.
+func TestOpensslIncludePaths(t *testing.T) {
+	root := t.TempDir()
+	etc := filepath.Join(root, "etc")
+	usr := filepath.Join(root, "usr", "share", "crypto-policies")
+	backEnds := filepath.Join(etc, "crypto-policies", "back-ends")
+	confDir := filepath.Join(etc, "pki", "tls")
+	for _, d := range []string{usr, backEnds, filepath.Join(confDir, "openssl.d")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The real include target lives under /usr and is reached through a
+	// symlink in /etc; it in turn includes a file nobody has bound.
+	nested := filepath.Join(etc, "extra.cnf")
+	if err := os.WriteFile(nested, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	policy := filepath.Join(usr, "opensslcnf.txt")
+	if err := os.WriteFile(policy, []byte(".include = "+nested+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(backEnds, "opensslcnf.config")
+	if err := os.Symlink(policy, link); err != nil {
+		t.Fatal(err)
+	}
+	// A second include, this one already inside a bound tree.
+	inTree := filepath.Join(confDir, "openssl.d", "extra.conf")
+	if err := os.WriteFile(inTree, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	conf := filepath.Join(confDir, "openssl.cnf")
+	body := ".include " + filepath.Join(confDir, "openssl.d") + "\n.include = " + link + "\n.include /does/not/exist\n"
+	if err := os.WriteFile(conf, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	bound := []string{filepath.Join(root, "usr"), filepath.Join(etc, "pki")}
+	got := opensslIncludePaths([]string{conf, filepath.Join(root, "absent.cnf")}, bound)
+
+	// The symlink's /etc path and the file it transitively includes are the
+	// only ones not already reachable in the sandbox. A nonexistent include
+	// target is nothing flar can mount, and neither the config itself nor the
+	// include under /etc/pki needs a mount of its own.
+	want := []string{link, nested}
+	if !slices.Equal(got, want) {
+		t.Errorf("opensslIncludePaths = %v, want %v", got, want)
+	}
+}
+
+// TestPathCovered checks that containment is tested on path boundaries, not
+// string prefixes: /etc/sslsomething is not inside /etc/ssl.
+func TestPathCovered(t *testing.T) {
+	roots := []string{"/usr", "/etc/ssl/"}
+	for _, tc := range []struct {
+		path string
+		want bool
+	}{
+		{"/usr", true},
+		{"/usr/share/crypto-policies/DEFAULT/opensslcnf.txt", true},
+		{"/usr-local/x", false},
+		{"/etc/ssl/openssl.cnf", true},
+		{"/etc/sslsomething", false},
+		{"/etc/crypto-policies/back-ends/opensslcnf.config", false},
+	} {
+		if got := pathCovered(tc.path, roots); got != tc.want {
+			t.Errorf("pathCovered(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}

@@ -123,6 +123,169 @@ func containerCacheDir(home string) string {
 	return filepath.Join(home, ".cache", "flar", "containers")
 }
 
+// opensslConfCandidates lists the paths where a distribution's OpenSSL build
+// keeps its master configuration file. OpenSSL compiles OPENSSLDIR in, so the
+// location varies: Fedora and RHEL use /etc/pki/tls, Debian and Ubuntu use
+// /usr/lib/ssl with /etc/ssl symlinked in, Arch and Alpine use /etc/ssl, and
+// source builds default to /usr/local/ssl. All of them are probed rather than
+// stopping at the first hit, because a host can carry more than one OpenSSL
+// and the agent inside the sandbox may link against either.
+var opensslConfCandidates = []string{
+	"/etc/ssl/openssl.cnf",
+	"/etc/pki/tls/openssl.cnf",
+	"/etc/openssl/openssl.cnf",
+	"/usr/lib/ssl/openssl.cnf",
+	"/usr/local/ssl/openssl.cnf",
+}
+
+// maxOpensslIncludeDepth bounds how far opensslIncludePaths follows nested
+// .include directives. Real configurations nest one or two levels; the limit
+// only exists so a pathological chain cannot spin.
+const maxOpensslIncludeDepth = 8
+
+// opensslIncludePaths returns the host paths that the system OpenSSL
+// configuration pulls in with .include directives, so they can be bound into
+// the sandbox. A missing include target is fatal to OpenSSL initialization,
+// not a warning: on Fedora the stock /etc/pki/tls/openssl.cnf includes
+// /etc/crypto-policies/back-ends/opensslcnf.config, and without it every
+// OpenSSL consumer in the sandbox dies at startup with "OpenSSL configuration
+// error ... calling stat(...)" — which is what makes node unusable there.
+//
+// The targets are discovered by reading the host's own configuration rather
+// than hardcoding the crypto-policies layout, since the set of includes (and
+// whether there are any at all) differs across distributions.
+//
+// confPaths are the configuration files to scan; ones that do not exist are
+// skipped. bound lists paths already bind-mounted into the sandbox, whose
+// contents therefore need no separate mount. Returned paths are absolute,
+// deduplicated, and exist on the host.
+func opensslIncludePaths(confPaths, bound []string) []string {
+	var out []string
+	added := make(map[string]bool)
+	visited := make(map[string]bool)
+	covered := append([]string{}, bound...)
+
+	add := func(p string) {
+		if added[p] || pathCovered(p, covered) {
+			return
+		}
+		added[p] = true
+		out = append(out, p)
+		if info, err := os.Stat(p); err == nil && info.IsDir() {
+			covered = append(covered, p)
+		}
+	}
+
+	// walk parses one configuration file, or every entry of a configuration
+	// directory, and records what it includes. It stats through symlinks
+	// because bwrap's --ro-bind resolves the source path the same way: on
+	// Fedora the include target is a symlink into /usr/share/crypto-policies,
+	// and binding it at its /etc path is exactly what OpenSSL then finds.
+	var walk func(path string, depth int)
+	walk = func(path string, depth int) {
+		if depth > maxOpensslIncludeDepth || visited[path] {
+			return
+		}
+		visited[path] = true
+
+		info, err := os.Stat(path)
+		if err != nil {
+			return
+		}
+		if info.IsDir() {
+			entries, err := os.ReadDir(path)
+			if err != nil {
+				return
+			}
+			for _, e := range entries {
+				walk(filepath.Join(path, e.Name()), depth+1)
+			}
+			return
+		}
+
+		for _, inc := range parseOpensslIncludes(path) {
+			if !filepath.IsAbs(inc) {
+				// OpenSSL resolves a relative include against the directory of
+				// the file that names it.
+				inc = filepath.Join(filepath.Dir(path), inc)
+			}
+			inc = filepath.Clean(inc)
+			if _, err := os.Stat(inc); err != nil {
+				// Nothing to bind, and OpenSSL will fail on it identically
+				// inside and outside the sandbox. Not flar's problem to fix.
+				continue
+			}
+			add(inc)
+			walk(inc, depth+1)
+		}
+	}
+
+	for _, conf := range confPaths {
+		if _, err := os.Stat(conf); err != nil {
+			continue
+		}
+		// The configuration file itself has to be reachable too; on the usual
+		// layouts it already lives under a bound path and add() drops it.
+		add(conf)
+		walk(conf, 0)
+	}
+	return out
+}
+
+// parseOpensslIncludes extracts the targets of the .include directives in an
+// OpenSSL configuration file. Both accepted spellings are handled:
+//
+//	.include /path/to/file
+//	.include = /path/to/file
+//
+// Targets containing $ are skipped: OpenSSL expands variables and $ENV:: at
+// load time against state flar cannot reproduce here, so guessing at the path
+// would be worse than leaving it alone.
+func parseOpensslIncludes(path string) []string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		rest, ok := strings.CutPrefix(line, ".include")
+		if !ok {
+			continue
+		}
+		// A separator must follow, so a section named e.g. `.includes` is not
+		// mistaken for the directive.
+		if rest == "" || !strings.ContainsAny(rest[:1], " \t=") {
+			continue
+		}
+		val := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(rest), "="))
+		if i := strings.Index(val, "#"); i >= 0 {
+			val = strings.TrimSpace(val[:i])
+		}
+		val = strings.Trim(val, `"'`)
+		if val == "" || strings.Contains(val, "$") {
+			continue
+		}
+		out = append(out, val)
+	}
+	return out
+}
+
+// pathCovered reports whether path is already inside one of roots, either
+// because it is a root itself or because a root is an ancestor directory.
+func pathCovered(path string, roots []string) bool {
+	for _, root := range roots {
+		root = strings.TrimSuffix(root, "/")
+		if root == "" {
+			continue
+		}
+		if path == root || strings.HasPrefix(path, root+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // containerSupportArgs writes the configuration rootless podman needs into
 // tempConfig and returns the bwrap arguments that mount it into the sandbox.
 // hostEtcContainers is the host's /etc/containers path when it exists, or ""
@@ -464,6 +627,18 @@ func RunSandbox(opts RunOpts) (int, error) {
 		if _, err := os.Stat(p); err == nil {
 			bwrapArgs = append(bwrapArgs, "--ro-bind-try", p, p)
 		}
+	}
+
+	// The system OpenSSL configuration can .include files that live outside
+	// every path bound above — on Fedora and RHEL it includes the
+	// crypto-policies back-end under /etc/crypto-policies. OpenSSL treats a
+	// missing include as a hard error, so without these the sandbox has no
+	// working TLS at all and node in particular refuses to start. Mounted
+	// after optPaths so an include nested inside one of those trees layers
+	// over it rather than being hidden by it.
+	alreadyBound := append([]string{"/usr"}, optPaths...)
+	for _, p := range opensslIncludePaths(opensslConfCandidates, alreadyBound) {
+		bwrapArgs = append(bwrapArgs, "--ro-bind-try", p, p)
 	}
 
 	// Mount essential kernel filesystems
