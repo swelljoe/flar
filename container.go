@@ -163,11 +163,16 @@ func opensslIncludePaths(confPaths, bound []string) []string {
 	var out []string
 	added := make(map[string]bool)
 	visited := make(map[string]bool)
+	covered := append([]string{}, bound...)
 
 	add := func(p string) {
-		if !added[p] && !pathCovered(p, bound) {
-			added[p] = true
-			out = append(out, p)
+		if added[p] || pathCovered(p, covered) {
+			return
+		}
+		added[p] = true
+		out = append(out, p)
+		if info, err := os.Stat(p); err == nil && info.IsDir() {
+			covered = append(covered, p)
 		}
 	}
 
