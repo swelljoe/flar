@@ -14,7 +14,7 @@ Bubblewrap is extremely well-tested, and actively maintained. It is used by Flat
 
 ## Features
 
-- **Bubblewrap Sandbox**: Runs the agent in an unprivileged user namespace using a clean root directory (`tmpfs`). System paths (`/usr`, `/bin`, `/lib`, `/lib64`, etc.) are mounted read-only from the host, ensuring host packages are immediately available without container image management.
+- **Bubblewrap Sandbox**: Runs the agent in an unprivileged user namespace using a clean root directory (`tmpfs`). System paths (`/usr`, `/bin`, `/lib`, `/lib64`, etc.) are mounted read-only from the host, ensuring host packages are immediately available without container image management. The host's OpenSSL configuration is parsed for `.include` directives and the targets are mounted too — on Fedora and RHEL that pulls in `/etc/crypto-policies`, without which OpenSSL fails to initialize and Node-based agents refuse to start.
 - **Strict Filesystem Isolation**: Only the target project directory is bind-mounted read-write. The rest of the host home directory is hidden, protecting ssh keys, shell configurations, and personal files from prompt injection attacks.
 - **Network Sandboxing**: 
   - **Isolated Mode (Default)**: The network namespace is unshared. Internet access is tunneled through a host-side HTTP/HTTPS proxy that performs DNS lookup on the host and blocks traffic to loopback, private (RFC 1918/CGNAT), link-local (including the `169.254.169.254` cloud metadata endpoint), and multicast addresses. The proxy dials the IP it validated (no DNS re-resolution) and never follows redirects internally, so a public URL cannot bounce the agent to a blocked address.
