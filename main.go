@@ -10,11 +10,17 @@ import (
 
 // Config represents the settings read from a config file.
 type Config struct {
-	Agent          string `json:"agent"`
-	Ask            bool   `json:"ask"`
-	AllowPorts     []int  `json:"allow_ports"`
-	Network        string `json:"network"`
-	ContainerCache bool   `json:"container_cache"`
+	Agent          string   `json:"agent"`
+	Ask            bool     `json:"ask"`
+	AllowPorts     []int    `json:"allow_ports"`
+	Network        string   `json:"network"`
+	ContainerCache bool     `json:"container_cache"`
+	// OmpAllowedModels restricts which omp providers' API keys are forwarded
+	// into the sandbox. Only honored from the global config (or CLI) — a
+	// project-level .flar.json cannot set it, since that would let a checked-in
+	// config reduce isolation by limiting which keys the agent can read.
+	// Only used when agent == "omp".
+	OmpAllowedModels []string `json:"omp_allowed_models"`
 }
 
 type intSlice []int
@@ -64,7 +70,7 @@ func main() {
 	}
 
 	// 1. Define command-line flags
-	agentFlag := flag.String("m", "", "Specify the agent to run (claude, codex, agy, copilot, reasonix, kimi, pool, qwen, mimo)")
+	agentFlag := flag.String("m", "", "Specify the agent to run (claude, codex, agy, copilot, reasonix, kimi, pool, qwen, mimo, omp)")
 	askFlag := flag.Bool("ask", false, "Disable bypass of agent permissions/approvals (ask for permission)")
 	networkFlag := flag.String("network", "", "Network mode: isolated (default) or host")
 	containerCacheFlag := flag.Bool("container-cache", false, "Persist container images built or pulled by podman inside the sandbox under ~/.cache/flar/containers (default: ephemeral, discarded on exit)")
@@ -118,7 +124,7 @@ func main() {
 
 	// Validate agent
 	switch selectedAgent {
-	case AgentClaude, AgentCodex, AgentAgy, AgentCopilot, AgentReasonix, AgentKimi, AgentPool, AgentQwen, AgentMimo:
+	case AgentClaude, AgentCodex, AgentAgy, AgentCopilot, AgentReasonix, AgentKimi, AgentPool, AgentQwen, AgentMimo, AgentOmp:
 		// Valid
 	default:
 		fmt.Fprintf(os.Stderr, "Error: Unknown or unsupported agent: %s\n", selectedAgent)
@@ -227,16 +233,17 @@ func main() {
 
 	// 6. Run the Bubblewrap sandbox
 	exitCode, runErr := RunSandbox(RunOpts{
-		ProjectDir:     absProjectDir,
-		TempConfig:     tempConfig,
-		TempNetDir:     tempNetDir,
-		AllowPorts:     allowPorts,
-		Agent:          selectedAgent,
-		Network:        networkMode,
-		AskMode:        askMode,
-		Verbose:        *verboseFlag,
-		ExtraArgs:      agentArgs,
-		ContainerCache: containerCache,
+		ProjectDir:      absProjectDir,
+		TempConfig:      tempConfig,
+		TempNetDir:      tempNetDir,
+		AllowPorts:      allowPorts,
+		Agent:           selectedAgent,
+		Network:         networkMode,
+		AskMode:         askMode,
+		Verbose:         *verboseFlag,
+		ExtraArgs:       agentArgs,
+		ContainerCache:  containerCache,
+		OmpAllowedModels: config.OmpAllowedModels,
 	})
 
 	// 7. Tear down host-side state before exiting: the os.Exit calls below
@@ -287,6 +294,9 @@ func loadConfig(projectDir string) Config {
 			}
 			if local.ContainerCache {
 				fmt.Fprintf(os.Stderr, "Warning: ignoring container_cache in %s: the container cache can only be enabled from the global config or with -container-cache\n", localPath)
+			}
+			if len(local.OmpAllowedModels) > 0 {
+				fmt.Fprintf(os.Stderr, "Warning: ignoring omp_allowed_models in %s: the model allowlist can only be set in the global config\n", localPath)
 			}
 			return Config{Agent: local.Agent, Ask: local.Ask}
 		}
@@ -396,6 +406,20 @@ func autoDetectAgent() Agent {
 		}
 		if _, exists := os.LookupEnv("XIAOMI_API_KEY"); exists {
 			return AgentMimo
+		}
+
+		// Check 10. Omp
+		if fileExists(filepath.Join(home, ".omp")) {
+			return AgentOmp
+		}
+		if _, exists := os.LookupEnv("ANTHROPIC_API_KEY"); exists {
+			return AgentOmp
+		}
+		if _, exists := os.LookupEnv("OPENAI_API_KEY"); exists {
+			return AgentOmp
+		}
+		if _, exists := os.LookupEnv("GEMINI_API_KEY"); exists {
+			return AgentOmp
 		}
 	}
 

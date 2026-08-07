@@ -212,6 +212,31 @@ func PrepareConfigDir(agent Agent, absProjectDir string) (string, error) {
 				return "", err
 			}
 		}
+
+	case AgentOmp:
+		// omp's agent directory (~/.omp/agent/) holds settings (config.yml),
+		// model definitions (models.yml), the auth store (agent.db), session
+		// files (sessions/), a prompt-history SQLite database (history.db),
+		// content-addressed blobs (blobs/), and terminal breadcrumbs
+		// (terminal-sessions/).
+		//
+		// sessions/ is already project-scoped on disk (each project gets its
+		// own subdirectory named <scope>-<basename>-<sha256(cwd)>/), but the
+		// directory also contains sessions for every other project. Copying it
+		// as-is would leak other projects' transcripts, so only the current
+		// project's session subdirectory is live-bound at run time (see
+		// prepareOmpStore). history.db is a global SQLite database mixing all
+		// projects and is replaced at run time by a per-project shadow copy.
+		// terminal-sessions/ holds cross-project breadcrumbs and is skipped.
+		// blobs/, config.yml, models.yml, and agent.db are safe to copy.
+		srcOmp := filepath.Join(home, ".omp", "agent")
+		if _, err := os.Stat(srcOmp); err == nil {
+			destOmp := filepath.Join(tempDir, "omp-agent")
+			if err := CopyDirExcept(srcOmp, destOmp, ompSkipCopy); err != nil {
+				os.RemoveAll(tempDir)
+				return "", err
+			}
+		}
 	}
 
 	return tempDir, nil
@@ -388,6 +413,24 @@ var qwenSkipCopy = map[string]bool{
 	"projects": true,
 	"tmp":      true,
 	"usage":    true,
+}
+
+// ompSkipCopy lists paths under ~/.omp/agent/ (relative to it) that flar does
+// NOT copy into the sandbox config. omp's sessions are already project-scoped
+// on disk (each project gets its own subdirectory under sessions/), but the
+// directory also contains sessions for every other project; copying it as-is
+// would leak other projects' transcripts. The current project's session
+// subdirectory is live-bound at run time by prepareOmpStore. history.db is a
+// global SQLite database mixing all projects and is replaced at run time by a
+// per-project shadow copy. terminal-sessions/ holds cross-project breadcrumbs.
+// blobs/ (content-addressed, shared), config.yml, models.yml, and agent.db are
+// safe to copy.
+var ompSkipCopy = map[string]bool{
+	"sessions":         true,
+	"history.db":       true,
+	"history.db-wal":   true,
+	"history.db-shm":   true,
+	"terminal-sessions": true,
 }
 
 // CopyDirExcept recursively copies src to dst, skipping any entry whose path

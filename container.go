@@ -28,6 +28,7 @@ const (
 	AgentPool     Agent = "pool"
 	AgentQwen     Agent = "qwen"
 	AgentMimo     Agent = "mimo"
+	AgentOmp      Agent = "omp"
 )
 
 // commonEnvVars is the set of non-secret host environment variables that flar
@@ -53,7 +54,6 @@ var commonEnvVars = []string{
 // needs to authenticate inside the sandbox. Only the variables for the agent
 // actually being run are forwarded: flar exists to minimize the blast area of
 // a prompt injection or supply-chain attack, and an agent has no legitimate
-// reason to read another agent's API keys.
 var agentEnvVars = map[Agent][]string{
 	AgentClaude:   {"ANTHROPIC_API_KEY"},
 	AgentCodex:    {"OPENAI_API_KEY"},
@@ -64,6 +64,11 @@ var agentEnvVars = map[Agent][]string{
 	AgentPool:     {"POOLSIDE_API_KEY", "POOLSIDE_API_URL"},
 	AgentQwen:     {"DASHSCOPE_API_KEY", "BAILIAN_CODING_PLAN_API_KEY", "BAILIAN_TOKEN_PLAN_API_KEY"},
 	AgentMimo:     {"XIAOMI_API_KEY"},
+	// omp can authenticate via many different providers' API keys. When no model
+	// allowlist is configured, all of the common provider keys are forwarded so
+	// the user can switch models freely. With a model allowlist (see RunOpts.OmpAllowedModels),
+	// envVarsForAgentOmp forwards only the keys for the allowed providers.
+	AgentOmp:      {"ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "OPENAI_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY", "DEEPSEEK_API_KEY", "XAI_API_KEY", "MISTRAL_API_KEY", "COPILOT_GITHUB_TOKEN", "KIMI_API_KEY", "XIAOMI_API_KEY", "MOONSHOT_API_KEY", "QWEN_PORTAL_API_KEY", "QWEN_OAUTH_TOKEN", "OPENROUTER_API_KEY"},
 }
 
 // envVarsForAgent returns the host environment variables forwarded into the
@@ -72,6 +77,55 @@ var agentEnvVars = map[Agent][]string{
 func envVarsForAgent(agent Agent) []string {
 	vars := append([]string{}, commonEnvVars...)
 	return append(vars, agentEnvVars[agent]...)
+}
+
+// ompProviderEnvVars maps each omp provider ID to the environment variables
+// that supply its credentials. Used by envVarsForAgentOmp to forward only the
+// keys for allowlisted providers when OmpAllowedModels is set.
+var ompProviderEnvVars = map[string][]string{
+	"anthropic":          {"ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"},
+	"openai":             {"OPENAI_API_KEY"},
+	"openai-codex":     {"OPENAI_API_KEY"},
+	"google":           {"GEMINI_API_KEY"},
+	"deepseek":           {"DEEPSEEK_API_KEY"},
+	"xai":                {"XAI_API_KEY"},
+	"mistral":            {"MISTRAL_API_KEY"},
+	"github-copilot":     {"COPILOT_GITHUB_TOKEN"},
+	"kimi-code":          {"KIMI_API_KEY"},
+	"xiaomi":             {"XIAOMI_API_KEY"},
+	"moonshot":           {"MOONSHOT_API_KEY"},
+	"qwen-portal":        {"QWEN_PORTAL_API_KEY", "QWEN_OAUTH_TOKEN"},
+	"openrouter":         {"OPENROUTER_API_KEY"},
+	"azure":              {"AZURE_OPENAI_API_KEY"},
+	"amazon-bedrock":     {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"},
+	"google-vertex":      {"GOOGLE_APPLICATION_CREDENTIALS"},
+	"huggingface":        {"HUGGINGFACE_HUB_TOKEN", "HF_TOKEN"},
+	"nvidia":             {"NVIDIA_API_KEY"},
+	"together":           {"TOGETHER_API_KEY"},
+	"fireworks":          {"FIREWORKS_API_KEY"},
+}
+
+// envVarsForAgentOmp returns the host environment variables forwarded into the
+// sandbox for omp. When allowedProviders is non-empty, only the credential
+// variables for those providers are forwarded — limiting the blast radius of a
+// prompt injection by preventing the agent from reading API keys for models
+// the user did not authorize for flar. When empty, all common provider keys
+// are forwarded (matching the default AgentOmp entry in agentEnvVars).
+func envVarsForAgentOmp(allowedProviders []string) []string {
+	vars := append([]string{}, commonEnvVars...)
+	if len(allowedProviders) == 0 {
+		return append(vars, agentEnvVars[AgentOmp]...)
+	}
+	seen := map[string]bool{}
+	for _, p := range allowedProviders {
+		for _, v := range ompProviderEnvVars[p] {
+			if !seen[v] {
+				seen[v] = true
+				vars = append(vars, v)
+			}
+		}
+	}
+	return vars
 }
 
 // ensureFile creates an empty file (and its parent directories) if it does not
@@ -108,6 +162,13 @@ type RunOpts struct {
 	// When false, container storage lives on the sandbox's ephemeral tmpfs
 	// and is discarded on exit.
 	ContainerCache bool
+	// OmpAllowedModels restricts which omp providers' API keys are forwarded
+	// into the sandbox. When non-empty, only the credential environment
+	// variables for the listed provider IDs are forwarded, preventing the
+	// sandboxed agent from reading API keys for models the user did not
+	// authorize for flar. When empty, all common provider keys are forwarded.
+	// Only used when Agent == AgentOmp.
+	OmpAllowedModels []string
 }
 
 // containerCacheDir returns the host directory where flar persists container
@@ -533,6 +594,8 @@ func RunSandbox(opts RunOpts) (int, error) {
 		agentCmd = "qwen"
 	case AgentMimo:
 		agentCmd = "mimo"
+	case AgentOmp:
+		agentCmd = "omp"
 	default:
 		return 0, fmt.Errorf("unknown or unsupported agent: %s", opts.Agent)
 	}
@@ -886,6 +949,36 @@ func RunSandbox(opts RunOpts) (int, error) {
 				if err := os.MkdirAll(hostProjMem, 0o700); err == nil {
 					bwrapArgs = append(bwrapArgs, "--bind", hostProjMem, hostProjMem)
 				}
+		}
+	case AgentOmp:
+			// omp's config directory (~/.omp/agent/) holds settings
+			// (config.yml), model definitions (models.yml), the auth store
+			// (agent.db), session files (sessions/), a prompt-history SQLite
+			// database (history.db), content-addressed blobs (blobs/), and
+			// terminal breadcrumbs (terminal-sessions/).
+			//
+			// The temp copy (prepared by PrepareConfigDir) excludes sessions/,
+			// history.db, and terminal-sessions/. Those are replaced at run
+			// time by a per-project shadow store so other projects' sessions
+			// and history never enter the sandbox.
+			ompPath := filepath.Join(opts.TempConfig, "omp-agent")
+			if _, err := os.Stat(ompPath); err == nil {
+				bwrapArgs = append(bwrapArgs, "--dir", filepath.Join(hostHome, ".omp"))
+				bwrapArgs = append(bwrapArgs, "--dir", filepath.Join(hostHome, ".omp", "agent"))
+				bwrapArgs = append(bwrapArgs, "--bind", ompPath, filepath.Join(hostHome, ".omp", "agent"))
+
+				// Bind this project's scoped session store and history database
+				// over the copied config. Sessions created in the sandbox persist
+				// and can be resumed, while other projects' sessions and history
+				// stay invisible.
+				if store, err := prepareOmpStore(hostHome, absProjectDir); err == nil {
+					bwrapArgs = append(bwrapArgs, "--bind",
+						filepath.Join(store, "sessions"),
+						filepath.Join(hostHome, ".omp", "agent", "sessions"))
+					bwrapArgs = append(bwrapArgs, "--bind",
+						filepath.Join(store, "history.db"),
+						filepath.Join(hostHome, ".omp", "agent", "history.db"))
+				}
 			}
 		}
 
@@ -962,7 +1055,13 @@ func RunSandbox(opts RunOpts) (int, error) {
 	// Pass environment variables: the common non-secret set plus only the
 	// credential variables the selected agent needs.
 	bwrapArgs = append(bwrapArgs, "--setenv", "HOME", hostHome)
-	for _, env := range envVarsForAgent(opts.Agent) {
+	var envVars []string
+	if opts.Agent == AgentOmp {
+		envVars = envVarsForAgentOmp(opts.OmpAllowedModels)
+	} else {
+		envVars = envVarsForAgent(opts.Agent)
+	}
+	for _, env := range envVars {
 		if val, exists := os.LookupEnv(env); exists {
 			bwrapArgs = append(bwrapArgs, "--setenv", env, val)
 		}
@@ -1045,6 +1144,14 @@ func RunSandbox(opts RunOpts) (int, error) {
 		// mimo needs --trust to skip the workspace trust prompt inside the
 		// sandbox, since the project directory is bind-mounted.
 		agentArgs = append(agentArgs, "--trust")
+	case AgentOmp:
+		// Use the resolved host path: omp's install location may not be on
+		// PATH, but the binary is bind-mounted at exactly this location inside
+		// the sandbox.
+		agentArgs = append(agentArgs, hostAgentPath)
+		if !opts.AskMode {
+			agentArgs = append(agentArgs, "--yolo")
+		}
 	}
 
 	if len(opts.ExtraArgs) > 0 {

@@ -99,6 +99,12 @@ func TestEnvVarsForAgentIncludesPoolAPIKey(t *testing.T) {
 // its own credential environment variables. Forwarding every agent's API keys
 // into every sandbox would let a compromised or prompt-injected agent read
 // unrelated secrets — exactly the blast area flar is meant to contain.
+//
+// omp is exempt from the cross-agent leak check: it is an open-harness agent
+// that supports many providers, so it intentionally shares credential env vars
+// with other agents (e.g. ANTHROPIC_API_KEY belongs to both claude and omp).
+// omp's model allowlist (envVarsForAgentOmp) is what prevents unauthorized key
+// exposure when no allowlist is set.
 func TestEnvVarsForAgentScopesCredentials(t *testing.T) {
 	for agent, creds := range agentEnvVars {
 		vars := envVarsForAgent(agent)
@@ -108,9 +114,13 @@ func TestEnvVarsForAgentScopesCredentials(t *testing.T) {
 				t.Errorf("envVarsForAgent(%q) is missing its own credential var %q", agent, env)
 			}
 		}
-		// Every OTHER agent's credentials must be absent.
+		// Every OTHER agent's credentials must be absent — except omp, which
+		// intentionally shares provider env vars with other agents.
+		if agent == AgentOmp {
+			continue
+		}
 		for other, otherCreds := range agentEnvVars {
-			if other == agent {
+			if other == agent || other == AgentOmp {
 				continue
 			}
 			for _, env := range otherCreds {
