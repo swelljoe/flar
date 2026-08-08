@@ -28,6 +28,7 @@ const (
 	AgentPool     Agent = "pool"
 	AgentQwen     Agent = "qwen"
 	AgentMimo     Agent = "mimo"
+	AgentOmp      Agent = "omp"
 )
 
 // commonEnvVars is the set of non-secret host environment variables that flar
@@ -64,6 +65,10 @@ var agentEnvVars = map[Agent][]string{
 	AgentPool:     {"POOLSIDE_API_KEY", "POOLSIDE_API_URL"},
 	AgentQwen:     {"DASHSCOPE_API_KEY", "BAILIAN_CODING_PLAN_API_KEY", "BAILIAN_TOKEN_PLAN_API_KEY"},
 	AgentMimo:     {"XIAOMI_API_KEY"},
+	// Omp can use many providers. By default only PI_* role vars are forwarded;
+	// provider API keys are forwarded only for providers whose models are allowed
+	// via -omp-model (see filterOmpModels).
+	AgentOmp:      {"PI_DEFAULT_MODEL", "PI_SMOL_MODEL", "PI_SLOW_MODEL", "PI_PLAN_MODEL"},
 }
 
 // envVarsForAgent returns the host environment variables forwarded into the
@@ -108,6 +113,13 @@ type RunOpts struct {
 	// When false, container storage lives on the sandbox's ephemeral tmpfs
 	// and is discarded on exit.
 	ContainerCache bool
+	// OmpModelPatterns restricts which model provider(s) are allowed inside
+	// an omp sandbox. Each pattern is a prefix or exact provider ID from
+	// models.yml (e.g. "openai", "anthropic", "llama-cpp-cat"). Models whose
+	// provider does not match any pattern are removed from the sandbox's
+	// models.yml; only matching providers' env vars are forwarded. Empty means
+	// "forward models.yml as-is" (all providers allowed).
+	OmpModelPatterns []string
 }
 
 // containerCacheDir returns the host directory where flar persists container
@@ -533,6 +545,8 @@ func RunSandbox(opts RunOpts) (int, error) {
 		agentCmd = "qwen"
 	case AgentMimo:
 		agentCmd = "mimo"
+	case AgentOmp:
+		agentCmd = "omp"
 	default:
 		return 0, fmt.Errorf("unknown or unsupported agent: %s", opts.Agent)
 	}
@@ -887,8 +901,30 @@ func RunSandbox(opts RunOpts) (int, error) {
 					bwrapArgs = append(bwrapArgs, "--bind", hostProjMem, hostProjMem)
 				}
 			}
-		}
+		case AgentOmp:
+			// Bind the copied omp config (~/.omp/agent prepared by PrepareConfigDir).
+			ompPath := filepath.Join(opts.TempConfig, ".omp")
+			if _, err := os.Stat(ompPath); err == nil {
+				// If -omp-model was set, filter models.yml to only allowed providers
+				// before mounting, so disallowed provider keys don't leak into the sandbox.
+				modelsPath := filepath.Join(ompPath, "agent", "models.yml")
+				if opts.OmpModelPatterns != nil {
+					filterOmpModels(modelsPath, opts.OmpModelPatterns)
+				}
+				bwrapArgs = append(bwrapArgs, "--bind", ompPath, filepath.Join(hostHome, ".omp"))
 
+				// Live-bind only THIS project's session directory from the host
+				// (over the copied .omp), so sessions run in the sandbox are
+				// written straight to disk and can be resumed with `omp -c`.
+				// OMP encodes project paths the same way as Claude — replacing
+				// every non-alphanumeric character with '-'.
+				slug := claudeProjectSlug(absProjectDir)
+				hostProj := filepath.Join(hostHome, ".omp", "agent", "sessions", slug)
+				if err := os.MkdirAll(hostProj, 0o700); err == nil {
+					bwrapArgs = append(bwrapArgs, "--bind", hostProj, hostProj)
+				}
+			}
+		}
 		// Git config
 		gitConfigPath := filepath.Join(opts.TempConfig, ".gitconfig")
 		if _, err := os.Stat(gitConfigPath); err == nil {
@@ -965,6 +1001,17 @@ func RunSandbox(opts RunOpts) (int, error) {
 	for _, env := range envVarsForAgent(opts.Agent) {
 		if val, exists := os.LookupEnv(env); exists {
 			bwrapArgs = append(bwrapArgs, "--setenv", env, val)
+		}
+	}
+
+	// For omp with -omp-model, also forward provider-specific API keys for
+	// the allowed providers only. This keeps other providers' keys out of the
+	// sandbox even if they exist in the host environment.
+	if opts.Agent == AgentOmp && opts.OmpModelPatterns != nil {
+		for _, env := range envVarsForOmpProviders(opts.OmpModelPatterns) {
+			if val, exists := os.LookupEnv(env); exists {
+				bwrapArgs = append(bwrapArgs, "--setenv", env, val)
+			}
 		}
 	}
 
@@ -1045,6 +1092,11 @@ func RunSandbox(opts RunOpts) (int, error) {
 		// mimo needs --trust to skip the workspace trust prompt inside the
 		// sandbox, since the project directory is bind-mounted.
 		agentArgs = append(agentArgs, "--trust")
+	case AgentOmp:
+		agentArgs = append(agentArgs, "omp")
+		if !opts.AskMode {
+			agentArgs = append(agentArgs, "--auto-approve")
+		}
 	}
 
 	if len(opts.ExtraArgs) > 0 {

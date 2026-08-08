@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -212,6 +213,21 @@ func PrepareConfigDir(agent Agent, absProjectDir string) (string, error) {
 				return "", err
 			}
 		}
+
+	case AgentOmp:
+		// OMP keeps its agent config, auth, and session history under
+		// ~/.omp/agent/. Copy it excluding the sessions/ directory: the
+		// current project's sessions are live-bound from the host at run
+		// time so they persist and can be resumed with `omp -c` / `--resume`,
+		// while other projects' sessions stay invisible.
+		srcOmp := filepath.Join(home, ".omp", "agent")
+		if _, err := os.Stat(srcOmp); err == nil {
+			destOmp := filepath.Join(tempDir, ".omp")
+			if err := CopyDirExcept(srcOmp, filepath.Join(destOmp, "agent"), ompSkipCopy); err != nil {
+				os.RemoveAll(tempDir)
+				return "", err
+			}
+		}
 	}
 
 	return tempDir, nil
@@ -231,6 +247,30 @@ var claudeConfigAllowlist = []string{
 	"plugins",             // installed plugins
 	"skills",              // installed skills
 	"commands",            // custom slash commands
+}
+
+// ompSkipCopy lists paths under ~/.omp/agent that flar does NOT copy into the
+// sandbox config:
+//   - sessions/: the global session directory mixing every project. The current
+//     project's sessions are live-bound from the host at run time; copying them
+//     here would expose every other project's conversation history.
+//   - terminal-sessions/: PTY session tracking, not needed in sandbox.
+//   - history.db, models.db, agent.db: global SQLite databases shared across
+//     projects. Only config.yml and models.yml (filtered if -omp-model is set)
+//     are needed.
+var ompSkipCopy = map[string]bool{
+	"session": true,
+	"terminal-sessions": true,
+	"history.db": true,
+	"history.db-wal": true,
+	"history.db-shm": true,
+	"agent.db": true,
+	"agent.db-wal": true,
+	"agent.db-shm": true,
+	"models.db": true,
+	"models.db-wal": true,
+	"models.db-shm": true,
+	"last-changelog-version": true,
 }
 
 // copyClaudeConfig copies only the allowlisted entries of ~/.claude into dst. It
@@ -473,4 +513,174 @@ func CopyDir(src, dst string) error {
 	}
 
 	return nil
+}
+
+// filterOmpModels rewrites models.yml at path, removing providers whose ID
+// does not match any pattern in allowed. Each pattern is matched as a
+// prefix or exact provider ID. If allowed is empty, models.yml is left
+// untouched. If models.yml cannot be parsed or rewritten, it is left as-is.
+func filterOmpModels(path string, allowed []string) {
+	if len(allowed) == 0 {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+
+	// Simple YAML-aware filter: we walk the file looking for "providers:"
+	// at top level, then for each provider block remove it if none of the
+	// patterns match the provider key. This is fragile but sufficient for
+	// the stable models.yml format; a full YAML parser would be overkill.
+	var sb strings.Builder
+	lines := strings.Split(string(data), "\n")
+
+	type scope struct {
+		indent    int
+		key       string
+		inModels  bool
+		providerKey string
+	}
+
+	providerMatches := func(key string) bool {
+		for _, p := range allowed {
+			if strings.HasPrefix(key, p) || strings.HasPrefix(p, key) {
+				return true
+			}
+		}
+		return false
+	}
+
+	s := scope{}
+	for _, line := range lines {
+		if line == "" {
+			sb.WriteString(line + "\n")
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+
+		// Top-level "providers:" marker
+		if line == "providers:" || strings.TrimSpace(line) == "providers:" {
+			s.inModels = true
+			s.indent = indent
+			sb.WriteString(line + "\n")
+			continue
+		}
+
+		// Top-level key that ends the providers block (no indent)
+		if s.inModels && indent == 0 && strings.HasSuffix(line, ":") {
+			s.inModels = false
+			sb.WriteString(line + "\n")
+			continue
+		}
+
+		if !s.inModels {
+			sb.WriteString(line + "\n")
+			continue
+		}
+
+		trimmed := strings.TrimSpace(line)
+
+		// Provider key at the providers block indent + 2 (one level in)
+		if s.indent+2 == indent && strings.HasSuffix(trimmed, ":") {
+			key := strings.TrimSuffix(trimmed, ":")
+			s.providerKey = key
+			if !providerMatches(key) {
+				// Skip this provider block entirely
+				s.indent = indent
+				continue
+			}
+			sb.WriteString(line + "\n")
+			continue
+		}
+
+		// Inside a provider block; skip if the parent provider was filtered
+		if s.providerKey != "" && s.indent+2 < indent {
+			_ = false // not top-level; continue writing unless we're in a filtered block
+		}
+
+		// Check if we've left the current provider block (indent <= provider indent)
+		if s.providerKey != "" && indent <= s.indent+2 && strings.HasSuffix(trimmed, ":") {
+			s.providerKey = ""
+		}
+
+		// If we're inside a filtered provider block (providerKey is set but we've already started skipping)
+		if s.providerKey != "" && !providerMatches(s.providerKey) {
+			continue
+		}
+
+		sb.WriteString(line + "\n")
+	}
+
+	if sb.String() == string(data) {
+		return // no changes
+	}
+
+	if err := os.WriteFile(path, []byte(sb.String()), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to filter omp models.yml: %v\n", err)
+	}
+}
+
+// envVarsForOmpProviders returns the provider-specific environment variables
+// that should be forwarded into an omp sandbox for the given allowed provider
+// patterns. Each pattern is matched as a prefix or exact provider ID.
+// This is used by RunSandbox when -omp-model is set.
+func envVarsForOmpProviders(allowed []string) []string {
+	// Map provider patterns to their standard env vars.
+	providerEnvVars := map[string][]string{
+		"openai":         {"OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_ORG_ID"},
+		"anthropic":      {"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"},
+		"google":         {"GOOGLE_API_KEY"},
+		"gemini":         {"GEMINI_API_KEY", "GOOGLE_API_KEY"},
+		"azure":          {"AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_BASE_URL"},
+		"deepseek":       {"DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL"},
+		"xai":            {"XAI_API_KEY", "XAI_BASE_URL"},
+		"perplexity":     {"PERPLEXITY_API_KEY"},
+		"fireworks":      {"FIREWORKS_API_KEY"},
+		"together":       {"TOGETHER_API_KEY"},
+		"groq":           {"GROQ_API_KEY"},
+		"ollama":         {"OLLAMA_HOST"},
+		"llama-cpp":      {"LLAMA_CPP_BASE_URL"},
+		"litellm":        {"LITELLM_API_KEY"},
+		"anyscale":       {"ANYSCALE_API_KEY"},
+		"mistral":        {"MISTRAL_API_KEY"},
+		"cohere":         {"COHERE_API_KEY"},
+		"replicate":      {"REPLICATE_API_KEY"},
+		"voyage":         {"VOYAGE_API_KEY"},
+		"sambanova":      {"SAMBANOVA_API_KEY"},
+		"cloudflare":     {"CLOUDFLARE_API_TOKEN"},
+		"deepinfra":      {"DEEPINFRA_API_KEY"},
+		"zai":            {"ZAI_API_KEY", "ZHIPUAI_API_KEY"},
+		"tinyfish":       {"TINYFISH_API_KEY"},
+		"jina":           {"JINA_API_KEY"},
+		"kagi":           {"KAGI_API_KEY"},
+		"tavily":         {"TAVILY_API_KEY"},
+		"firecrawl":      {"FIRECRAWL_API_KEY"},
+		"brave":          {"BRAVE_API_KEY"},
+		"kimi":           {"KIMI_API_KEY"},
+		"exa":            {"EXA_API_KEY"},
+		"startpage":      {"STARTPAGE_API_KEY"},
+		"duckduckgo":     {"DUCKDUCKGO_API_KEY"},
+		"ecosea":         {"ECOSIA_API_KEY"},
+		"mojeek":         {"MOJEEK_API_KEY"},
+		"searxng":        {"SEARXNG_API_KEY"},
+		"public":         {"PUBLIC_API_KEY"},
+	}
+
+	result := make(map[string]bool)
+	for _, pattern := range allowed {
+		for provider, vars := range providerEnvVars {
+			if strings.HasPrefix(provider, pattern) || strings.HasPrefix(pattern, provider) {
+				for _, v := range vars {
+					result[v] = true
+				}
+			}
+		}
+	}
+
+	out := make([]string, 0, len(result))
+	for k := range result {
+		out = append(out, k)
+	}
+	return out
 }
