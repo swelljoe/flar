@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Config represents the settings read from a config file.
@@ -64,11 +65,12 @@ func main() {
 	}
 
 	// 1. Define command-line flags
-	agentFlag := flag.String("m", "", "Specify the agent to run (claude, codex, agy, copilot, reasonix, kimi, pool, qwen, mimo)")
+	agentFlag := flag.String("m", "", "Specify the agent to run (claude, codex, agy, copilot, reasonix, kimi, pool, qwen, mimo, omp)")
 	askFlag := flag.Bool("ask", false, "Disable bypass of agent permissions/approvals (ask for permission)")
 	networkFlag := flag.String("network", "", "Network mode: isolated (default) or host")
-	containerCacheFlag := flag.Bool("container-cache", false, "Persist container images built or pulled by podman inside the sandbox under ~/.cache/flar/containers (default: ephemeral, discarded on exit)")
+	ompModelFlag := flag.String("omp-model", "", "For omp: comma-separated allowed model provider patterns from models.yml (e.g. openai,anthropic,llama-cpp-cat); models whose provider does not match any pattern are removed. Empty = all providers allowed. Omitting this flag warns once; set it to avoid forwarding unintended API keys.")
 	verboseFlag := flag.Bool("v", false, "Enable verbose logging")
+	containerCacheFlag := flag.Bool("container-cache", false, "Persist container images built or pulled by podman inside the sandbox under ~/.cache/flar/containers (default: ephemeral, discarded on exit)")
 
 	var allowPortsFlag intSlice
 	flag.Var(&allowPortsFlag, "allow-port", "Allow a specific local TCP port through the network sandbox (can specify multiple)")
@@ -118,11 +120,32 @@ func main() {
 
 	// Validate agent
 	switch selectedAgent {
-	case AgentClaude, AgentCodex, AgentAgy, AgentCopilot, AgentReasonix, AgentKimi, AgentPool, AgentQwen, AgentMimo:
+	case AgentClaude, AgentCodex, AgentAgy, AgentCopilot, AgentReasonix, AgentKimi, AgentPool, AgentQwen, AgentMimo, AgentOmp:
 		// Valid
 	default:
 		fmt.Fprintf(os.Stderr, "Error: Unknown or unsupported agent: %s\n", selectedAgent)
 		os.Exit(1)
+	}
+
+	// Parse -omp-model patterns (needed before the validation warnings below)
+	var ompModelPatterns []string
+	if *ompModelFlag != "" {
+		for _, p := range strings.Split(*ompModelFlag, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				ompModelPatterns = append(ompModelPatterns, p)
+			}
+		}
+	}
+
+	// -omp-model only applies to omp; warn if used with other agents
+	if selectedAgent != AgentOmp && len(ompModelPatterns) > 0 {
+		fmt.Fprintf(os.Stderr, "Warning: -omp-model is only used with agent 'omp'; ignored.\n")
+	}
+
+	// Warn once if running omp without -omp-model
+	if selectedAgent == AgentOmp && len(ompModelPatterns) == 0 {
+		fmt.Fprintf(os.Stderr, "Warning: running 'omp' without -omp-model allows all providers from models.yml and their API keys into the sandbox. To restrict which providers (and thus which API keys) are accessible, use -omp-model=<provider-patterns>.\n")
 	}
 
 	askMode := *askFlag
@@ -237,6 +260,7 @@ func main() {
 		Verbose:        *verboseFlag,
 		ExtraArgs:      agentArgs,
 		ContainerCache: containerCache,
+		OmpModelPatterns: ompModelPatterns,
 	})
 
 	// 7. Tear down host-side state before exiting: the os.Exit calls below
@@ -396,6 +420,14 @@ func autoDetectAgent() Agent {
 		}
 		if _, exists := os.LookupEnv("XIAOMI_API_KEY"); exists {
 			return AgentMimo
+		}
+
+		// Check 10. OMP
+		if fileExists(filepath.Join(home, ".omp")) {
+			return AgentOmp
+		}
+		if _, exists := os.LookupEnv("OMP_API_KEY"); exists {
+			return AgentOmp
 		}
 	}
 

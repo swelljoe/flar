@@ -2,7 +2,7 @@
 
 FLAR is the Fast Light Agent Restrictor. It runs on rocks called gars.
 
-It is a simple, lightweight CLI tool in Go to run coding agent CLIs (like Claude Code, Antigravity, Codex, Copilot, Reasonix, Kimi Code, Poolside, and Qwen Code) safely inside isolated [Bubblewrap (`bwrap`) sandboxes](https://github.com/containers/bubblewrap).
+It is a simple, lightweight CLI tool in Go to run coding agent CLIs (like Claude Code, Antigravity, Codex, Copilot, Reasonix, Kimi Code, OMP, Poolside, Qwen Code, and Mimo Code) safely inside isolated [Bubblewrap (`bwrap`) sandboxes](https://github.com/containers/bubblewrap).
 
 ![Antigravity CLI riding in a flar](/assets/agy-in-a-flar.png)
 
@@ -20,7 +20,7 @@ Bubblewrap is extremely well-tested, and actively maintained. It is used by Flat
   - **Isolated Mode (Default)**: The network namespace is unshared. Internet access is tunneled through a host-side HTTP/HTTPS proxy that performs DNS lookup on the host and blocks traffic to loopback, private (RFC 1918/CGNAT), link-local (including the `169.254.169.254` cloud metadata endpoint), and multicast addresses. The proxy dials the IP it validated (no DNS re-resolution) and never follows redirects internally, so a public URL cannot bounce the agent to a blocked address.
   - **Port Forwarding**: Selectively expose local services (e.g. databases, llama.cpp models) into the sandbox by mapping specific ports to the host's `localhost`.
   - **Host Mode**: Option to share the host's network namespace for unconstrained access.
-- **Dangerous Bypass Options**: Automatically injects flags (like `--dangerously-skip-permissions` for Claude/`agy` or `--dangerously-bypass-approvals-and-sandbox` for Codex) so agents run without runtime approval interruptions. Can be disabled with `-ask`. For Kimi Code, `--yolo` is omitted automatically when `-p`/`--prompt` is passed, since `kimi` rejects that combination. For Qwen Code, `--yolo` is injected unless `-ask` is set.
+- **Dangerous Bypass Options**: Automatically injects flags (like `--dangerously-skip-permissions` for Claude/`agy` or `--dangerously-bypass-approvals-and-sandbox` for Codex) so agents run without runtime approval interruptions. Can be disabled with `-ask`. For Kimi Code, `--yolo` is omitted automatically when `-p`/`--prompt` is passed, since `kimi` rejects that combination. For Qwen Code and OMP, `--yolo`/`--auto-approve` is injected unless `-ask` is set.
 - **Config Copying**: Automatically copies host credentials (like `~/.claude/`, `~/.codex/`, `~/.gemini/`, or GitHub CLI configurations) to a temporary directory mounted inside the sandbox home directory, leaving host config files untouched.
 - **Session Persistence & Resume**: When reasonably safe (currently Claude Code, Reasonix, and Qwen Code) conversations started inside a sandbox are written back to the host, so `--resume`/`--continue` works across runs — scoped to the current project so no other project's history enters the sandbox. Otherwise, history is forked on first run of `flar` for a given agent and project. See [Session persistence & resume](#session-persistence--resume).
 - **Keyring Bridging (`agy`)**: The Antigravity CLI stores its OAuth token in the OS keyring rather than a file. `flar` extracts only that one secret and serves it inside the sandbox through a private, in-process Secret Service — so the agent authenticates without exposing the rest of your keyring. See [Credentials](#credentials).
@@ -64,10 +64,11 @@ flar [flags] [path/to/project] [extra agent args/prompts...]
 
 ### Flags
 
-- `-m`: Specify the agent to run (`claude`, `codex`, `agy`, `copilot`, `reasonix`, `kimi`, `pool`, `qwen`). Defaults to checking available host configurations or environment variables.
+- `-m`: Specify the agent to run (`claude`, `codex`, `agy`, `copilot`, `reasonix`, `kimi`, `omp`, `pool`, `qwen`, `mimo`). Defaults to checking available host configurations or environment variables.
 - `-ask`: Do not skip permissions/approvals (forcing the agent to ask for permission).
 - `-network`: Network mode: `isolated` (default) or `host`.
 - `-allow-port`: Allow a specific local TCP port (e.g. `8080`, `11434`) through the isolated network sandbox. Can be specified multiple times.
+- `-omp-model`: For OMP only: comma-separated allowed model provider patterns from `~/.omp/agent/models.yml` (e.g. `openai,anthropic,llama-cpp-cat`). Models whose provider does not match any pattern are removed from the sandbox's copy of `models.yml`, and only matching providers' environment variables (like `OPENAI_API_KEY`) are forwarded. Empty means "allow all providers" (and forwards their env vars). Omitting this flag warns once; set it to avoid forwarding unintended API keys.
 - `-container-cache`: Persist container images built or pulled by podman inside the sandbox under `~/.cache/flar/containers` (respecting `XDG_CACHE_HOME`). Without it, container storage is ephemeral and discarded on exit. See [Container builds (podman)](#container-builds-podman).
 - `-v`: Enable verbose logging.
 
@@ -95,6 +96,8 @@ Because only a temporary copy of your config is mounted, agents run authenticate
 * **Codex / Copilot**: `~/.codex/`, `~/.copilot/`, and the GitHub CLI config.
 * **Kimi Code**: `~/.kimi-code/` — `config.toml`, `tui.toml`, and `device_id`. Kimi stores credentials in files (`storage = "file"`), so no keyring bridge is needed. Unlike the other agents, the credential dirs (`credentials/`, `oauth/`) are **live-bound from the host** rather than copied into flar's persistent shadow home: Kimi's access tokens live only ~15 minutes and the refresh token rotates on every use, so a copied token goes stale almost immediately, and a sandbox-side refresh of a copied token would invalidate the host's login (and vice versa). Live-binding means `kimi login` on the host is picked up immediately, at the cost of the sandbox being able to write to Kimi's own credential files (which hold only its OAuth tokens, readable by an authenticated agent anyway). The `bin/` (the `kimi` executable itself) and `updates/` directories are not copied; the real binary is bind-mounted read-only at run time.
 * **Poolside (`pool`)**: `~/.config/poolside/` — `credentials.json`, `settings.yaml`, and `skills/`. Pool stores API keys in `credentials.json` (and also honors the `POOLSIDE_API_KEY` environment variable), so no keyring bridge is needed. The config is copied to a temporary directory; the state directory (`~/.local/state/poolside/`) is forked per-project (see below).
+* **Mimo Code**: `~/.mimocode/` (data) and `~/.config/mimocode/` (config). Mimo stores credentials in `auth.json`, so no keyring bridge is needed. The config is copied to a temporary directory; the state directory is forked per-project (see below).
+* **OMP**: `~/.omp/agent/` — `config.yml`, `models.yml`, and model-specific settings. OMP's models are configured in `models.yml` with their providers and API keys (or base URLs). By default, the entire `models.yml` is copied into the sandbox. To restrict which providers (and thus which API keys) are accessible, use `-omp-model` — this removes disallowed providers from the sandbox's copy and prevents their environment variables from being forwarded. OMP also honors the `PI_DEFAULT_MODEL`, `PI_SMOL_MODEL`, `PI_SLOW_MODEL`, and `PI_PLAN_MODEL` environment variables for model roles. No keyring bridge is needed.
 * **Qwen Code**: `~/.qwen/` — `settings.json` (which holds API keys under its `env` key), `output-language.md`, `extensions/`, `skills/`, `memories/`, and `installation_id`. Qwen also honors the `DASHSCOPE_API_KEY`, `BAILIAN_CODING_PLAN_API_KEY`, and `BAILIAN_TOKEN_PLAN_API_KEY` environment variables. No keyring bridge is needed.
 
 ### Antigravity (`agy`) keyring
@@ -146,6 +149,7 @@ The first time `flar` runs `agy` in a project, it seeds that project's scoped st
 * **Reasonix**: Just like Claude Code. Reasonix keeps each project history in its own subdirectory directory, so it can be bindmounted in the same way as Claude Code, with the same caveat.
 
 * **Qwen Code**: Just like Claude Code and Reasonix. Qwen keeps each project's sessions in its own subdirectory (`~/.qwen/projects/<project-slug>/chats/`), so it can be bind-mounted in the same way, with the same caveat. The project slug uses the same encoding as Claude — replacing every non-alphanumeric character with `-`.
+* **OMP**: Just like Claude Code, Reasonix, and Qwen Code. OMP keeps each project's sessions in its own subdirectory (`~/.omp/agent/sessions/<project-slug>/`), so it can be live-bound in the same way, with the same caveat about prompt injection in history. The project slug uses the same encoding as Claude — replacing every non-alphanumeric character with `-`.
 
 * **Kimi Code**: as with Codex and Copilot, sessions are "forked" on first run in a project by `flar`, and are no longer shared with `kimi` running outside of `flar`.
 
