@@ -359,4 +359,3 @@ func TestRedactedArgsCoversOmpCredentials(t *testing.T) {
 		t.Error("redactedArgs: incorrectly redacted PATH")
 	}
 }
-

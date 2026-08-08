@@ -19,15 +19,15 @@ import (
 // The config.yml, .env, and skills/ dirs are the only user-facing config that
 // should be copied verbatim.
 var ompSkipCopy = map[string]bool{
-	"sessions":         true,
-	"history.db":       true,
-	"history.db-wal":   true,
-	"history.db-shm":   true,
-	"blobs":            true,
-	"agent.db":         true,
-	"agent.db-wal":     true,
-	"agent.db-shm":     true,
-	"caches":           true,
+	"sessions":       true,
+	"history.db":     true,
+	"history.db-wal": true,
+	"history.db-shm": true,
+	"blobs":          true,
+	"agent.db":       true,
+	"agent.db-wal":   true,
+	"agent.db-shm":   true,
+	"caches":         true,
 }
 
 // ompStoreRel is the path relative to the agent data dir (~/.omp/agent) that

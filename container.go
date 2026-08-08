@@ -537,9 +537,6 @@ func RunSandbox(opts RunOpts) (int, error) {
 		agentCmd = "mimo"
 	case AgentOmp:
 		agentCmd = "omp"
-
-
-
 	default:
 		return 0, fmt.Errorf("unknown or unsupported agent: %s", opts.Agent)
 	}
