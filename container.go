@@ -28,6 +28,7 @@ const (
 	AgentPool     Agent = "pool"
 	AgentQwen     Agent = "qwen"
 	AgentMimo     Agent = "mimo"
+	AgentOmp      Agent = "omp"
 )
 
 // commonEnvVars is the set of non-secret host environment variables that flar
@@ -64,6 +65,7 @@ var agentEnvVars = map[Agent][]string{
 	AgentPool:     {"POOLSIDE_API_KEY", "POOLSIDE_API_URL"},
 	AgentQwen:     {"DASHSCOPE_API_KEY", "BAILIAN_CODING_PLAN_API_KEY", "BAILIAN_TOKEN_PLAN_API_KEY"},
 	AgentMimo:     {"XIAOMI_API_KEY"},
+	AgentOmp:      {},
 }
 
 // envVarsForAgent returns the host environment variables forwarded into the
@@ -533,6 +535,11 @@ func RunSandbox(opts RunOpts) (int, error) {
 		agentCmd = "qwen"
 	case AgentMimo:
 		agentCmd = "mimo"
+	case AgentOmp:
+		agentCmd = "omp"
+
+
+
 	default:
 		return 0, fmt.Errorf("unknown or unsupported agent: %s", opts.Agent)
 	}
@@ -566,6 +573,19 @@ func RunSandbox(opts RunOpts) (int, error) {
 			defaultPath := filepath.Join(hostHome, ".mimocode", "bin", "mimo")
 			if _, err := os.Stat(defaultPath); err == nil {
 				hostAgentPath = defaultPath
+			}
+		}
+		// Fallback for omp's default install location (~/.local/bin/omp or
+		// the bun-managed global install directory).
+		if opts.Agent == AgentOmp && hostAgentPath == "" {
+			for _, d := range []string{
+				filepath.Join(hostHome, ".local", "bin", "omp"),
+				filepath.Join(hostHome, ".bun", "bin", "omp"),
+			} {
+				if _, err := os.Stat(d); err == nil {
+					hostAgentPath = d
+					break
+				}
 			}
 		}
 		// The current Copilot CLI installs as `copilot` in common setups, while
@@ -1045,6 +1065,13 @@ func RunSandbox(opts RunOpts) (int, error) {
 		// mimo needs --trust to skip the workspace trust prompt inside the
 		// sandbox, since the project directory is bind-mounted.
 		agentArgs = append(agentArgs, "--trust")
+	case AgentOmp:
+		// Use the resolved host path: omp is typically in PATH but fall back
+		// to common install locations via the fallback above.
+		agentArgs = append(agentArgs, hostAgentPath)
+		if !opts.AskMode {
+			agentArgs = append(agentArgs, "--dangerously-skip-permissions")
+		}
 	}
 
 	if len(opts.ExtraArgs) > 0 {
