@@ -64,7 +64,7 @@ func main() {
 	}
 
 	// 1. Define command-line flags
-	agentFlag := flag.String("m", "", "Specify the agent to run (claude, codex, agy, copilot, reasonix, kimi, pool, qwen, mimo)")
+	agentFlag := flag.String("m", "", "Specify the agent to run (claude, codex, agy, copilot, reasonix, kimi, pool, qwen, mimo, omp)")
 	askFlag := flag.Bool("ask", false, "Disable bypass of agent permissions/approvals (ask for permission)")
 	networkFlag := flag.String("network", "", "Network mode: isolated (default) or host")
 	containerCacheFlag := flag.Bool("container-cache", false, "Persist container images built or pulled by podman inside the sandbox under ~/.cache/flar/containers (default: ephemeral, discarded on exit)")
@@ -118,7 +118,7 @@ func main() {
 
 	// Validate agent
 	switch selectedAgent {
-	case AgentClaude, AgentCodex, AgentAgy, AgentCopilot, AgentReasonix, AgentKimi, AgentPool, AgentQwen, AgentMimo:
+	case AgentClaude, AgentCodex, AgentAgy, AgentCopilot, AgentReasonix, AgentKimi, AgentPool, AgentQwen, AgentMimo, AgentOmp:
 		// Valid
 	default:
 		fmt.Fprintf(os.Stderr, "Error: Unknown or unsupported agent: %s\n", selectedAgent)
@@ -396,6 +396,20 @@ func autoDetectAgent() Agent {
 		}
 		if _, exists := os.LookupEnv("XIAOMI_API_KEY"); exists {
 			return AgentMimo
+		}
+
+		// Check 10. OMP
+		// omp uses the same ANTHROPIC_API_KEY as Claude, so we only auto-detect
+		// it when its own config directory is present. This avoids false positives
+		// when the user has Claude configured but not omp.
+		if fileExists(filepath.Join(home, ".omp", "agent")) {
+			return AgentOmp
+		}
+		// Also detect via OMP-specific env vars that Claude does not use.
+		for _, env := range []string{"OMP_AUTH_BROKER_URL", "GEMINI_API_KEY"} {
+			if _, exists := os.LookupEnv(env); exists {
+				return AgentOmp
+			}
 		}
 	}
 

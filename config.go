@@ -212,6 +212,21 @@ func PrepareConfigDir(agent Agent, absProjectDir string) (string, error) {
 				return "", err
 			}
 		}
+
+	case AgentOmp:
+		// omp's agent data lives under ~/.omp/agent/. Only the global config
+		// files (config.yml, .env, skills/) are copied verbatim; sessions,
+		// history.db, agent.db, and blobs/ are replaced at run time by a
+		// project-scoped shadow home (see prepareOmpStore) so other
+		// projects' data never enters the sandbox.
+		srcOmp := ompAgentDir(home)
+		if _, err := os.Stat(srcOmp); err == nil {
+			destOmp := filepath.Join(tempDir, "omp-agent")
+			if err := CopyDirExcept(srcOmp, destOmp, ompSkipCopy); err != nil {
+				os.RemoveAll(tempDir)
+				return "", err
+			}
+		}
 	}
 
 	return tempDir, nil
