@@ -212,6 +212,22 @@ func PrepareConfigDir(agent Agent, absProjectDir string) (string, error) {
 				return "", err
 			}
 		}
+	case AgentOmp:
+		// omp stores config in ~/.omp/agent/ (config.yml, agent.db) and sessions
+		// under ~/.omp/agent/sessions/<dir-encoded>/. Sessions are project-scoped
+		// via dir encoding (home-relative with / replaced by -), so we can
+		// live-bind the project directory.
+		srcOmp := filepath.Join(home, ".omp", "agent")
+		if _, err := os.Stat(srcOmp); err == nil {
+			destOmp := filepath.Join(tempDir, ".omp")
+			// Copy config files but skip sessions/ and history.db for now;
+			// sessions will be live-bound per-project. History is global and
+			// filtered by cwd inside omp, so we keep it out for safety.
+			if err := CopyDirExcept(srcOmp, destOmp, ompSkipCopy); err != nil {
+				os.RemoveAll(tempDir)
+				return "", err
+			}
+		}
 	}
 
 	return tempDir, nil
@@ -388,6 +404,16 @@ var qwenSkipCopy = map[string]bool{
 	"projects": true,
 	"tmp":      true,
 	"usage":    true,
+}
+// ompSkipCopy lists paths under ~/.omp/agent that flar does NOT copy into the sandbox.
+// Sessions are project-scoped via dir encoding, so we live-bind the project directory.
+// history.db is global and filtered by cwd inside omp; we keep it out for safety to
+// avoid cross-project leakage of prompt history.
+var ompSkipCopy = map[string]bool{
+	"sessions":      true,
+	"history.db":    true,
+	"history.db-wal": true,
+	"history.db-shm": true,
 }
 
 // CopyDirExcept recursively copies src to dst, skipping any entry whose path
