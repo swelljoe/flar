@@ -2,7 +2,7 @@
 
 FLAR is the Fast Light Agent Restrictor. It runs on rocks called gars.
 
-It is a simple, lightweight CLI tool in Go to run coding agent CLIs (like Claude Code, Antigravity, Codex, Copilot, Reasonix, Kimi Code, Poolside, and Qwen Code) safely inside isolated [Bubblewrap (`bwrap`) sandboxes](https://github.com/containers/bubblewrap).
+It is a simple, lightweight CLI tool in Go to run coding agent CLIs (like Claude Code, Antigravity, Codex, Copilot, Reasonix, Kimi Code, Poolside, Qwen Code, Mimo, and Oh My Pi) safely inside isolated [Bubblewrap (`bwrap`) sandboxes](https://github.com/containers/bubblewrap).
 
 ![Antigravity CLI riding in a flar](/assets/agy-in-a-flar.png)
 
@@ -64,7 +64,7 @@ flar [flags] [path/to/project] [extra agent args/prompts...]
 
 ### Flags
 
-- `-m`: Specify the agent to run (`claude`, `codex`, `agy`, `copilot`, `reasonix`, `kimi`, `pool`, `qwen`). Defaults to checking available host configurations or environment variables.
+- `-m`: Specify the agent to run (`claude`, `codex`, `agy`, `copilot`, `reasonix`, `kimi`, `pool`, `qwen`, `mimo`, `omp`). Defaults to checking available host configurations or environment variables.
 - `-ask`: Do not skip permissions/approvals (forcing the agent to ask for permission).
 - `-network`: Network mode: `isolated` (default) or `host`.
 - `-allow-port`: Allow a specific local TCP port (e.g. `8080`, `11434`) through the isolated network sandbox. Can be specified multiple times.
@@ -96,6 +96,7 @@ Because only a temporary copy of your config is mounted, agents run authenticate
 * **Kimi Code**: `~/.kimi-code/` — `config.toml`, `tui.toml`, and `device_id`. Kimi stores credentials in files (`storage = "file"`), so no keyring bridge is needed. Unlike the other agents, the credential dirs (`credentials/`, `oauth/`) are **live-bound from the host** rather than copied into flar's persistent shadow home: Kimi's access tokens live only ~15 minutes and the refresh token rotates on every use, so a copied token goes stale almost immediately, and a sandbox-side refresh of a copied token would invalidate the host's login (and vice versa). Live-binding means `kimi login` on the host is picked up immediately, at the cost of the sandbox being able to write to Kimi's own credential files (which hold only its OAuth tokens, readable by an authenticated agent anyway). The `bin/` (the `kimi` executable itself) and `updates/` directories are not copied; the real binary is bind-mounted read-only at run time.
 * **Poolside (`pool`)**: `~/.config/poolside/` — `credentials.json`, `settings.yaml`, and `skills/`. Pool stores API keys in `credentials.json` (and also honors the `POOLSIDE_API_KEY` environment variable), so no keyring bridge is needed. The config is copied to a temporary directory; the state directory (`~/.local/state/poolside/`) is forked per-project (see below).
 * **Qwen Code**: `~/.qwen/` — `settings.json` (which holds API keys under its `env` key), `output-language.md`, `extensions/`, `skills/`, `memories/`, and `installation_id`. Qwen also honors the `DASHSCOPE_API_KEY`, `BAILIAN_CODING_PLAN_API_KEY`, and `BAILIAN_TOKEN_PLAN_API_KEY` environment variables. No keyring bridge is needed.
+* **Oh My Pi (`omp`)**: `~/.omp/agent/` — `config.yml` and `agent.db` (OAuth credentials). Sessions are stored per-project under `~/.omp/agent/sessions/<dir-encoded>/` where the directory name is derived from the cwd (home-relative with `/` replaced by `-`). `flar` live-binds only the current project's session directory, so other projects' histories stay invisible. Prompt history is in `history.db`, which is global and filtered by cwd inside omp; `flar` omits it from the copy to avoid cross-project leakage. omp honors many provider API keys via environment variables (e.g., `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`). **Warning**: omp can use many different provider keys; forwarding all of them exposes all your keys to the sandbox. Consider using `-m omp` with a dedicated environment or warning users in README.
 
 ### Antigravity (`agy`) keyring
 
@@ -146,7 +147,7 @@ The first time `flar` runs `agy` in a project, it seeds that project's scoped st
 * **Reasonix**: Just like Claude Code. Reasonix keeps each project history in its own subdirectory directory, so it can be bindmounted in the same way as Claude Code, with the same caveat.
 
 * **Qwen Code**: Just like Claude Code and Reasonix. Qwen keeps each project's sessions in its own subdirectory (`~/.qwen/projects/<project-slug>/chats/`), so it can be bind-mounted in the same way, with the same caveat. The project slug uses the same encoding as Claude — replacing every non-alphanumeric character with `-`.
-
+* **Oh My Pi (`omp`)**: Sessions are stored per-project under `~/.omp/agent/sessions/<dir-encoded>/`, where the directory name is derived from the cwd (home-relative with `/` replaced by `-`, bare `-` for home). `flar` live-binds only the current project's session directory, so sessions run in the sandbox persist and can be resumed with `omp --resume`, while other projects' histories stay invisible. Prompt history in `history.db` is global and filtered by cwd inside omp; `flar` omits it from the copy to avoid cross-project leakage.
 * **Kimi Code**: as with Codex and Copilot, sessions are "forked" on first run in a project by `flar`, and are no longer shared with `kimi` running outside of `flar`.
 
 Kimi Code splits resume state between per-workspace transcript directories (`~/.kimi-code/sessions/<workspace-id>/<session-id>/`, each self-attributing via the `workDir` in its `state.json`) and a global `session_index.jsonl`, which `kimi --continue` / `--session` needs in order to load a session at all. The index mixes every project's sessions (as absolute paths), and `workspaces.json` lists the root of every workspace ever opened, so neither can be bound into the sandbox as-is. Instead, `flar` gives each workspace a shadow Kimi home:

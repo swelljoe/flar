@@ -28,6 +28,7 @@ const (
 	AgentPool     Agent = "pool"
 	AgentQwen     Agent = "qwen"
 	AgentMimo     Agent = "mimo"
+	AgentOmp      Agent = "omp"
 )
 
 // commonEnvVars is the set of non-secret host environment variables that flar
@@ -64,6 +65,7 @@ var agentEnvVars = map[Agent][]string{
 	AgentPool:     {"POOLSIDE_API_KEY", "POOLSIDE_API_URL"},
 	AgentQwen:     {"DASHSCOPE_API_KEY", "BAILIAN_CODING_PLAN_API_KEY", "BAILIAN_TOKEN_PLAN_API_KEY"},
 	AgentMimo:     {"XIAOMI_API_KEY"},
+	AgentOmp:      {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "OPENAI_CODEX_OAUTH_TOKEN"},
 }
 
 // envVarsForAgent returns the host environment variables forwarded into the
@@ -497,6 +499,30 @@ func sandboxAgentScript(opts RunOpts, absHostFlar, agySecretInSandbox string) st
 	s.WriteString("exec \"$@\"\n")
 	return s.String()
 }
+// ompProjectSlug reproduces OMP's session directory encoding for a cwd.
+// OMP encodes home-relative paths by replacing / \ : with -, using a bare '-' for home.
+// If cwd is not under home, fallback to legacy absolute encoding.
+func ompProjectSlug(absPath, home string) string {
+	homeAbs, err := filepath.Abs(home)
+	if err != nil {
+		homeAbs = home
+	}
+	abs, err := filepath.Abs(absPath)
+	if err != nil {
+		abs = absPath
+	}
+	rel, err := filepath.Rel(homeAbs, abs)
+	if err != nil || filepath.IsAbs(rel) || strings.HasPrefix(rel, "..") {
+		enc := strings.NewReplacer("/", "-", "\\", "-", ":", "-").Replace(abs)
+		return "--" + enc + "--"
+	}
+	if rel == "." {
+		return "-"
+	}
+	enc := strings.NewReplacer("/", "-", "\\", "-", ":", "-").Replace(rel)
+	return "-" + enc
+}
+
 
 // RunSandbox runs the Bubblewrap sandbox with the specified options. It
 // returns the agent's exit code; a non-nil error means the sandbox itself
@@ -533,9 +559,12 @@ func RunSandbox(opts RunOpts) (int, error) {
 		agentCmd = "qwen"
 	case AgentMimo:
 		agentCmd = "mimo"
+	case AgentOmp:
+		agentCmd = "omp"
 	default:
 		return 0, fmt.Errorf("unknown or unsupported agent: %s", opts.Agent)
 	}
+
 
 	// Resolve the agent executable path on the host
 	hostAgentPath, err := exec.LookPath(agentCmd)
@@ -690,8 +719,8 @@ func RunSandbox(opts RunOpts) (int, error) {
 	// flar runs a private Secret Service serving only this token.
 	var agySecretInSandbox string
 
-	// Setup HOME directory structure inside sandbox
-	bwrapArgs = append(bwrapArgs, "--dir", hostHome)
+
+
 
 	// Bind-mount agent configurations into the home directory if prepared
 	if opts.TempConfig != "" {
@@ -887,7 +916,25 @@ func RunSandbox(opts RunOpts) (int, error) {
 					bwrapArgs = append(bwrapArgs, "--bind", hostProjMem, hostProjMem)
 				}
 			}
+		case AgentOmp:
+			ompPath := filepath.Join(opts.TempConfig, ".omp")
+			if _, err := os.Stat(ompPath); err == nil {
+				// Bind copied config (agent/ without sessions/history)
+				bwrapArgs = append(bwrapArgs, "--bind", ompPath, filepath.Join(hostHome, ".omp"))
+			}
+			// Live-bind the project-scoped sessions directory. OMP encodes cwd
+			// into a dir name: for home-relative paths, replace / \ : with -.
+			// We use the same encoding as OMP: home-relative with dashes.
+			// Fallback to bind whole sessions dir if encoding fails.
+			slug := ompProjectSlug(absProjectDir, hostHome)
+			hostSessionsRoot := filepath.Join(hostHome, ".omp", "agent", "sessions")
+			hostProjSessions := filepath.Join(hostSessionsRoot, slug)
+			if err := os.MkdirAll(hostProjSessions, 0o700); err == nil {
+				bwrapArgs = append(bwrapArgs, "--bind", hostProjSessions, hostProjSessions)
+			}
 		}
+
+
 
 		// Git config
 		gitConfigPath := filepath.Join(opts.TempConfig, ".gitconfig")
@@ -1206,6 +1253,9 @@ func RunSandbox(opts RunOpts) (int, error) {
 	}
 	return 0, waitErr
 }
+
+
+
 
 // firstChild returns the pid of the given process's first child, polling
 // /proc until one appears or the deadline passes. Reading the kernel's
