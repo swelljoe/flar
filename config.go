@@ -187,6 +187,31 @@ func PrepareConfigDir(agent Agent, absProjectDir string) (string, error) {
 		// mimo's user config lives in ~/.config/mimocode/ (or
 		// $XDG_CONFIG_HOME/mimocode/). Copy it excluding installation
 		// scaffolding (node_modules, package.json).
+
+	case AgentOmp:
+		// omp stores its conversation history in ~/.local/state/omp/projects/<project-slug>/
+		// with a history.db (SQLite) and sessions/ directory.
+		// flar live-binds the current project's history directory so sessions
+		// persist and can be resumed, while preventing cross-project contamination.
+		srcOmp := filepath.Join(home, ".local", "state", "flar", "omp")
+		if _, err := os.Stat(srcOmp); err == nil {
+			// Compute project slug using the same encoding as Claude
+			slug := claudeProjectSlug(absProjectDir)
+			srcProject := filepath.Join(srcOmp, "-" + slug)
+			destProject := filepath.Join(tempDir, ".omp", "-" + slug)
+			if err := os.MkdirAll(filepath.Dir(destProject), 0o700); err != nil {
+				os.RemoveAll(tempDir)
+				return "", err
+			}
+			// Live-bind the project's history directory from host into sandbox
+			if err := os.Symlink(srcProject, destProject); err != nil {
+				// Fall back to copy if symlink not possible
+				if err := CopyDir(srcProject, destProject); err != nil {
+					os.RemoveAll(tempDir)
+					return "", err
+				}
+			}
+		}
 		srcMimoCfg := mimoConfigDir(home)
 		if _, err := os.Stat(srcMimoCfg); err == nil {
 			destMimoCfg := filepath.Join(tempDir, "mimocode-config")

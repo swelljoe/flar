@@ -28,6 +28,7 @@ const (
 	AgentPool     Agent = "pool"
 	AgentQwen     Agent = "qwen"
 	AgentMimo     Agent = "mimo"
+	AgentOmp      Agent = "omp"
 )
 
 // commonEnvVars is the set of non-secret host environment variables that flar
@@ -63,6 +64,7 @@ var agentEnvVars = map[Agent][]string{
 	AgentKimi:     {"KIMI_API_KEY"},
 	AgentPool:     {"POOLSIDE_API_KEY", "POOLSIDE_API_URL"},
 	AgentQwen:     {"DASHSCOPE_API_KEY", "BAILIAN_CODING_PLAN_API_KEY", "BAILIAN_TOKEN_PLAN_API_KEY"},
+	AgentOmp:      {"OMP_API_KEY"},
 	AgentMimo:     {"XIAOMI_API_KEY"},
 }
 

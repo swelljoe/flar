@@ -64,7 +64,7 @@ func main() {
 	}
 
 	// 1. Define command-line flags
-	agentFlag := flag.String("m", "", "Specify the agent to run (claude, codex, agy, copilot, reasonix, kimi, pool, qwen, mimo)")
+	agentFlag := flag.String("m", "", "Specify the agent to run (claude, codex, agy, copilot, reasonix, kimi, pool, qwen, mimo, omp)")
 	askFlag := flag.Bool("ask", false, "Disable bypass of agent permissions/approvals (ask for permission)")
 	networkFlag := flag.String("network", "", "Network mode: isolated (default) or host")
 	containerCacheFlag := flag.Bool("container-cache", false, "Persist container images built or pulled by podman inside the sandbox under ~/.cache/flar/containers (default: ephemeral, discarded on exit)")
@@ -118,7 +118,7 @@ func main() {
 
 	// Validate agent
 	switch selectedAgent {
-	case AgentClaude, AgentCodex, AgentAgy, AgentCopilot, AgentReasonix, AgentKimi, AgentPool, AgentQwen, AgentMimo:
+	case AgentClaude, AgentCodex, AgentAgy, AgentCopilot, AgentReasonix, AgentKimi, AgentPool, AgentQwen, AgentMimo, AgentOmp:
 		// Valid
 	default:
 		fmt.Fprintf(os.Stderr, "Error: Unknown or unsupported agent: %s\n", selectedAgent)

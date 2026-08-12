@@ -64,7 +64,7 @@ flar [flags] [path/to/project] [extra agent args/prompts...]
 
 ### Flags
 
-- `-m`: Specify the agent to run (`claude`, `codex`, `agy`, `copilot`, `reasonix`, `kimi`, `pool`, `qwen`). Defaults to checking available host configurations or environment variables.
+- `-m`: Specify the agent to run (`claude`, `codex`, `agy`, `copilot`, `reasonix`, `kimi`, `pool`, `qwen`, `omp`). Defaults to checking available host configurations or environment variables.
 - `-ask`: Do not skip permissions/approvals (forcing the agent to ask for permission).
 - `-network`: Network mode: `isolated` (default) or `host`.
 - `-allow-port`: Allow a specific local TCP port (e.g. `8080`, `11434`) through the isolated network sandbox. Can be specified multiple times.
@@ -156,6 +156,10 @@ $XDG_STATE_HOME/flar/kimi/<project-slug>/
 ```
 
 (falling back to `~/.local/state/flar/kimi/<project-slug>/`). On first use it seeds that home with only the sessions attributed to the current workspace — read from each session's own `state.json` and from the host index, never from session contents — plus a scoped `session_index.jsonl`, this project's prompt-history file (`user-history/<md5(workDir)>.jsonl`), and a `workspaces.json` filtered down to this project. The whole shadow home is then bind-mounted as `~/.kimi-code` (with the host's `credentials/` and `oauth/` live-bound over it, as described in [Credentials](#credentials)), so new sessions persist there and `kimi --continue` can resume only this workspace's sessions.
+
+* **Omp (`omp`)**: omp stores its conversation history in `~/.local/state/flar/omp/<project-slug>/` with a `history.db` (SQLite) and `sessions/` directory. `flar` live-binds the current project's history directory from the host so sessions persist and can be resumed via `omp --continue`, while preventing cross-project contamination — only the current project's sessions are visible inside the sandbox. New sessions accumulate in the scoped store and are resumable on the next run. The project slug uses the same encoding as Claude Code — replacing every non-alphanumeric character with `-`.
+
+After the first run of `flar` for a given project, the scoped store becomes independent: sessions started with `omp` outside of `flar` are not visible inside, and vice versa. To re-seed or reset, delete the project's shadow home under `$XDG_STATE_HOME/flar/omp/`.
 
 * **Poolside (`pool`)**: as with Codex and Copilot, sessions are "forked" on first run in a project by `flar`, and are no longer shared with `pool` running outside of `flar`.
 
