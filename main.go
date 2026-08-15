@@ -14,6 +14,7 @@ type Config struct {
 	Ask            bool   `json:"ask"`
 	AllowPorts     []int  `json:"allow_ports"`
 	Network        string `json:"network"`
+	OmpModel       string `json:"omp_model"`
 	ContainerCache bool   `json:"container_cache"`
 }
 
@@ -63,12 +64,12 @@ func main() {
 		os.Exit(0)
 	}
 
-	// 1. Define command-line flags
-	agentFlag := flag.String("m", "", "Specify the agent to run (claude, codex, agy, copilot, reasonix, kimi, pool, qwen, mimo)")
+	agentFlag := flag.String("m", "", "Specify the agent to run (claude, codex, agy, copilot, reasonix, kimi, pool, qwen, mimo, omp)")
 	askFlag := flag.Bool("ask", false, "Disable bypass of agent permissions/approvals (ask for permission)")
 	networkFlag := flag.String("network", "", "Network mode: isolated (default) or host")
 	containerCacheFlag := flag.Bool("container-cache", false, "Persist container images built or pulled by podman inside the sandbox under ~/.cache/flar/containers (default: ephemeral, discarded on exit)")
 	verboseFlag := flag.Bool("v", false, "Enable verbose logging")
+	ompModelFlag := flag.String("omp-model", "", "For omp only: restrict which model/provider's credentials are exposed in the sandbox. Accepts a provider key (e.g. deepseek) or a model selector (e.g. openai/gpt-5.2); without it ALL provider credentials are exposed")
 
 	var allowPortsFlag intSlice
 	flag.Var(&allowPortsFlag, "allow-port", "Allow a specific local TCP port through the network sandbox (can specify multiple)")
@@ -118,7 +119,7 @@ func main() {
 
 	// Validate agent
 	switch selectedAgent {
-	case AgentClaude, AgentCodex, AgentAgy, AgentCopilot, AgentReasonix, AgentKimi, AgentPool, AgentQwen, AgentMimo:
+	case AgentClaude, AgentCodex, AgentAgy, AgentCopilot, AgentReasonix, AgentKimi, AgentPool, AgentQwen, AgentMimo, AgentOmp:
 		// Valid
 	default:
 		fmt.Fprintf(os.Stderr, "Error: Unknown or unsupported agent: %s\n", selectedAgent)
@@ -128,6 +129,15 @@ func main() {
 	askMode := *askFlag
 	if !askMode && config.Ask {
 		askMode = true
+	}
+
+	// -omp-model scopes omp's credential exposure; it is only meaningful for omp.
+	ompModel := *ompModelFlag
+	if ompModel == "" {
+		ompModel = config.OmpModel
+	}
+	if ompModel != "" && selectedAgent != AgentOmp {
+		fmt.Fprintln(os.Stderr, "Warning: -omp-model is only used with -m omp and is ignored for "+string(selectedAgent))
 	}
 
 	containerCache := *containerCacheFlag
@@ -236,6 +246,7 @@ func main() {
 		AskMode:        askMode,
 		Verbose:        *verboseFlag,
 		ExtraArgs:      agentArgs,
+		OmpModel:       ompModel,
 		ContainerCache: containerCache,
 	})
 
@@ -267,10 +278,10 @@ func main() {
 // able to weaken sandbox isolation: a checked-in config could otherwise turn
 // on host networking, open local ports, or add host directories the sandbox
 // may write to, for anyone who clones the repo and runs flar in it — exactly
-// the supply-chain scenario flar exists to contain. "network", "allow_ports",
-// and "container_cache" are therefore honored only from the user-level global
-// config (or the command line); "agent" and "ask" are safe to take from the
-// project config because they cannot reduce isolation.
+// network", "allow_ports", "container_cache", and "omp_model" are therefore
+// honored only from the user-level global config (or the command line);
+// "agent" and "ask" are safe to take from the project config because they
+// cannot reduce isolation.
 func loadConfig(projectDir string) Config {
 	var config Config
 
@@ -287,6 +298,9 @@ func loadConfig(projectDir string) Config {
 			}
 			if local.ContainerCache {
 				fmt.Fprintf(os.Stderr, "Warning: ignoring container_cache in %s: the container cache can only be enabled from the global config or with -container-cache\n", localPath)
+			}
+			if local.OmpModel != "" {
+				fmt.Fprintf(os.Stderr, "Warning: ignoring omp_model in %s: credential scoping can only be set from the global config or with -omp-model\n", localPath)
 			}
 			return Config{Agent: local.Agent, Ask: local.Ask}
 		}
@@ -396,6 +410,11 @@ func autoDetectAgent() Agent {
 		}
 		if _, exists := os.LookupEnv("XIAOMI_API_KEY"); exists {
 			return AgentMimo
+		}
+
+		// Check 10. Omp
+		if fileExists(filepath.Join(home, ".omp", "agent")) {
+			return AgentOmp
 		}
 	}
 

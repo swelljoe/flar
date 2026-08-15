@@ -28,6 +28,7 @@ const (
 	AgentPool     Agent = "pool"
 	AgentQwen     Agent = "qwen"
 	AgentMimo     Agent = "mimo"
+	AgentOmp      Agent = "omp"
 )
 
 // commonEnvVars is the set of non-secret host environment variables that flar
@@ -103,6 +104,10 @@ type RunOpts struct {
 	AskMode    bool
 	Verbose    bool
 	ExtraArgs  []string
+	// OmpModel scopes which model/provider's credentials omp may use inside
+	// the sandbox (see resolveOmpProviders). Empty means unscoped: every
+	// provider credential flar knows about is forwarded, and flar warns.
+	OmpModel string
 	// ContainerCache persists images and layers built or pulled by podman
 	// inside the sandbox under flar's own cache dir (see containerCacheDir).
 	// When false, container storage lives on the sandbox's ephemeral tmpfs
@@ -512,7 +517,6 @@ func RunSandbox(opts RunOpts) (int, error) {
 		return 0, fmt.Errorf("failed to resolve absolute project path: %w", err)
 	}
 
-	// Determine agent command to run
 	var agentCmd string
 	switch opts.Agent {
 	case AgentClaude:
@@ -533,6 +537,8 @@ func RunSandbox(opts RunOpts) (int, error) {
 		agentCmd = "qwen"
 	case AgentMimo:
 		agentCmd = "mimo"
+	case AgentOmp:
+		agentCmd = "omp"
 	default:
 		return 0, fmt.Errorf("unknown or unsupported agent: %s", opts.Agent)
 	}
@@ -578,6 +584,13 @@ func RunSandbox(opts RunOpts) (int, error) {
 				if _, statErr := os.Stat(defaultPath); statErr == nil {
 					hostAgentPath = defaultPath
 				}
+			}
+		}
+		// Fallback for omp's default install location (~/.local/bin/omp)
+		if opts.Agent == AgentOmp && hostAgentPath == "" {
+			defaultPath := filepath.Join(hostHome, ".local", "bin", "omp")
+			if _, err := os.Stat(defaultPath); err == nil {
+				hostAgentPath = defaultPath
 			}
 		}
 		if hostAgentPath == "" {
@@ -887,8 +900,32 @@ func RunSandbox(opts RunOpts) (int, error) {
 					bwrapArgs = append(bwrapArgs, "--bind", hostProjMem, hostProjMem)
 				}
 			}
-		}
+		case AgentOmp:
+			// omp keeps everything under ~/.omp/agent: config.yml/models.yml,
+			// session transcripts (project-scoped on disk), and the global
+			// SQLite history + credential databases. The latter mix every
+			// project, so flar replaces them at run time with a per-project
+			// shadow store forked once from the host (see prepareOmpStore):
+			// other projects' sessions and prompt history never enter the
+			// sandbox. The temp config copy is merged into the store on first
+			// seed, so it is not bound directly.
+			hostOmpAgent := filepath.Join(hostHome, ".omp", "agent")
+			store, err := prepareOmpStore(hostHome, absProjectDir, resolveOmpProviders(opts.OmpModel), opts.TempConfig)
+			if err != nil {
+				return 0, fmt.Errorf("prepare omp store: %w", err)
+			}
+			bwrapArgs = append(bwrapArgs, "--dir", filepath.Dir(hostOmpAgent))
+			bwrapArgs = append(bwrapArgs, "--bind", store, hostOmpAgent)
 
+			// The native addons (.node files compiled for bun) live outside
+			// the agent dir and are required or omp fails to start. Bind them
+			// read-only from the host; they carry no per-project state.
+			nativesDir := filepath.Join(hostHome, ".omp", "natives")
+			if dirExists(nativesDir) {
+				bwrapArgs = append(bwrapArgs, "--dir", filepath.Dir(nativesDir))
+				bwrapArgs = append(bwrapArgs, "--ro-bind", nativesDir, nativesDir)
+			}
+		}
 		// Git config
 		gitConfigPath := filepath.Join(opts.TempConfig, ".gitconfig")
 		if _, err := os.Stat(gitConfigPath); err == nil {
@@ -968,6 +1005,18 @@ func RunSandbox(opts RunOpts) (int, error) {
 		}
 	}
 
+	// omp's credential surface is wider than one env var (every provider it
+	// supports has its own). Forward only what resolvedOmpEnvVars computed
+	// from the -omp-model scoping, and warn when the user runs unscoped.
+	if opts.Agent == AgentOmp {
+		ompEnv, scoped := resolvedOmpEnvVars(resolveOmpProviders(opts.OmpModel))
+		for name, val := range ompEnv {
+			bwrapArgs = append(bwrapArgs, "--setenv", name, val)
+		}
+		if !scoped {
+			fmt.Fprintln(os.Stderr, "Warning: no -omp-model given; exposing ALL provider credentials to the sandboxed omp. Restrict with -omp-model <provider or model selector>.")
+		}
+	}
 	// Point agy at the private Secret Service and tell the internal service
 	// where to read the token from.
 	if agySecretInSandbox != "" {
@@ -1045,6 +1094,14 @@ func RunSandbox(opts RunOpts) (int, error) {
 		// mimo needs --trust to skip the workspace trust prompt inside the
 		// sandbox, since the project directory is bind-mounted.
 		agentArgs = append(agentArgs, "--trust")
+	case AgentOmp:
+		// Use the resolved host path: omp's install dir (~/.local/bin) is not
+		// necessarily on PATH, but the binary is bind-mounted at exactly this
+		// location inside the sandbox.
+		agentArgs = append(agentArgs, hostAgentPath)
+		if !opts.AskMode {
+			agentArgs = append(agentArgs, "--auto-approve")
+		}
 	}
 
 	if len(opts.ExtraArgs) > 0 {
