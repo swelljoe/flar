@@ -2,7 +2,7 @@
 
 FLAR is the Fast Light Agent Restrictor. It runs on rocks called gars.
 
-It is a simple, lightweight CLI tool in Go to run coding agent CLIs (like Claude Code, Antigravity, Codex, Copilot, Reasonix, Kimi Code, Poolside, and Qwen Code) safely inside isolated [Bubblewrap (`bwrap`) sandboxes](https://github.com/containers/bubblewrap).
+It is a simple, lightweight CLI tool in Go to run coding agent CLIs (like Claude Code, Antigravity, Codex, Copilot, Reasonix, Kimi Code, Poolside, Qwen Code, and OMP) safely inside isolated [Bubblewrap (`bwrap`) sandboxes](https://github.com/containers/bubblewrap).
 
 ![Antigravity CLI riding in a flar](/assets/agy-in-a-flar.png)
 
@@ -64,7 +64,8 @@ flar [flags] [path/to/project] [extra agent args/prompts...]
 
 ### Flags
 
-- `-m`: Specify the agent to run (`claude`, `codex`, `agy`, `copilot`, `reasonix`, `kimi`, `pool`, `qwen`). Defaults to checking available host configurations or environment variables.
+- `-m`: Specify the agent to run (`claude`, `codex`, `agy`, `copilot`, `reasonix`, `kimi`, `pool`, `qwen`, `mimo`, `omp`). Defaults to checking available host configurations or environment variables.
+- `-omp-model`: For OMP only — restrict which model/provider's credentials the sandbox may use (see [Credentials](#credentials)). Accepts a provider key (`deepseek`) or a model selector (`openai/gpt-5.2`); without it, every provider credential is exposed and `flar` warns at startup.
 - `-ask`: Do not skip permissions/approvals (forcing the agent to ask for permission).
 - `-network`: Network mode: `isolated` (default) or `host`.
 - `-allow-port`: Allow a specific local TCP port (e.g. `8080`, `11434`) through the isolated network sandbox. Can be specified multiple times.
@@ -81,11 +82,12 @@ You can configure options per-project in `<project>/.flar.json` or globally in `
   "ask": false,
   "network": "isolated",
   "allow_ports": [5432, 11434],
-  "container_cache": false
+  "container_cache": false,
+  "omp_model": ""
 }
 ```
 
-A project-level `.flar.json` travels with the repository, so it cannot weaken sandbox isolation: `network`, `allow_ports`, and `container_cache` are honored **only** from the global config (or the `-network` / `-allow-port` / `-container-cache` flags) and are ignored — with a warning — when found in a project config. Otherwise a malicious repo could turn on host networking, open local ports, or add host directories the sandbox may write to, for anyone who clones it and runs `flar`. `agent` and `ask` are safe to set per-project.
+A project-level `.flar.json` travels with the repository, so it cannot weaken sandbox isolation: `network`, `allow_ports`, `container_cache`, and `omp_model` are honored **only** from the global config (or the `-network` / `-allow-port` / `-container-cache` / `-omp-model` flags) and are ignored — with a warning — when found in a project config. Otherwise a malicious repo could turn on host networking, open local ports, or add host directories the sandbox may write to, for anyone who clones it and runs `flar`. `agent` and `ask` are safe to set per-project.
 
 ## Credentials
 
@@ -96,6 +98,10 @@ Because only a temporary copy of your config is mounted, agents run authenticate
 * **Kimi Code**: `~/.kimi-code/` — `config.toml`, `tui.toml`, and `device_id`. Kimi stores credentials in files (`storage = "file"`), so no keyring bridge is needed. Unlike the other agents, the credential dirs (`credentials/`, `oauth/`) are **live-bound from the host** rather than copied into flar's persistent shadow home: Kimi's access tokens live only ~15 minutes and the refresh token rotates on every use, so a copied token goes stale almost immediately, and a sandbox-side refresh of a copied token would invalidate the host's login (and vice versa). Live-binding means `kimi login` on the host is picked up immediately, at the cost of the sandbox being able to write to Kimi's own credential files (which hold only its OAuth tokens, readable by an authenticated agent anyway). The `bin/` (the `kimi` executable itself) and `updates/` directories are not copied; the real binary is bind-mounted read-only at run time.
 * **Poolside (`pool`)**: `~/.config/poolside/` — `credentials.json`, `settings.yaml`, and `skills/`. Pool stores API keys in `credentials.json` (and also honors the `POOLSIDE_API_KEY` environment variable), so no keyring bridge is needed. The config is copied to a temporary directory; the state directory (`~/.local/state/poolside/`) is forked per-project (see below).
 * **Qwen Code**: `~/.qwen/` — `settings.json` (which holds API keys under its `env` key), `output-language.md`, `extensions/`, `skills/`, `memories/`, and `installation_id`. Qwen also honors the `DASHSCOPE_API_KEY`, `BAILIAN_CODING_PLAN_API_KEY`, and `BAILIAN_TOKEN_PLAN_API_KEY` environment variables. No keyring bridge is needed.
+* **OMP**: credentials come from two places, and both are scoped per-project:
+  * **Environment variables.** OMP supports a long list of providers (Anthropic, OpenAI, Gemini, DeepSeek, Moonshot/Kimi, xAI, Groq, Mistral, ...) each with its own `*_API_KEY` variable. By default — or when `-omp-model` names no known provider — flar forwards **every** such variable that is set on the host and prints a warning at startup, because a prompt injection could exfiltrate all of them. Pass `-omp-model <provider>` (or `<provider>/<model>`) to forward only that provider's credential variables. `OMP_*`/`PI_*` model-configuration variables are always forwarded; proxy and OAuth plumbing (`PI_PROXY*`, `PI_OAUTH_*`) never is.
+  * **Credential database.** OMP also stores credentials (API keys, OAuth tokens) in the SQLite table `auth_credentials` inside `~/.omp/agent/agent.db`. flar forks that database into the project's shadow store and, when `-omp-model` names a provider, deletes every other provider's rows (plus their refresh-lease/block/cache references). Without `-omp-model` all stored credentials are forked unchanged — again, with a startup warning.
+  * **Local models.** Providers defined in `models.yml` with `apiKey: none` (e.g. a local llama.cpp endpoint) need no credential at all; scope to them the same way (`-omp-model llama-cpp-cat/...`). If their base URL is a host-internal address, also open it with `-allow-port <port>` or use `-network host`.
 
 ### Antigravity (`agy`) keyring
 
@@ -173,6 +179,16 @@ $XDG_STATE_HOME/flar/pool/<project-slug>/
 
 (falling back to `~/.local/state/flar/pool/<project-slug>/`). On first use it seeds that directory with only the sessions attributed to the current workspace — determined by reading each trajectory's `session.start` event and checking `working_directories` — copying both the matching trajectory files and their corresponding session metadata files. It also copies this project's prompt history and logs from `pool/<project-slug>/`. The whole shadow state is then bind-mounted as `~/.local/state/poolside` inside the sandbox (with the config copy bind-mounted at `~/.config/poolside`), so new sessions persist there and `pool -r` / `--resume` can resume only this workspace's sessions.
 
+* **OMP**: as with Codex and Pool, OMP's global stores are "forked" on first run in a project by `flar`, and are no longer shared with `omp` running outside of `flar`.
+
+OMP keeps everything under `~/.omp/agent/`: session transcripts (already grouped per project into `sessions/<bucket>/`, each transcript self-attesting its own `cwd` in the header record), a global prompt history (`history.db`, SQLite + FTS5, rows carry a `cwd` column), and the global credential/telemetry store (`agent.db`). Only the transcripts are project-scoped on disk — and even there, two distinct projects can encode to the same bucket name (`a/b` vs `a-b`), so the directory name alone is not a safe scope. Binding `~/.omp/agent` as-is would let a sandboxed `omp -c` / `--resume` pick up another project's sessions and history. To prevent that, `flar` gives each workspace its own **shadow agent home**:
+
+```
+$XDG_STATE_HOME/flar/omp/<project-slug>/
+```
+
+(falling back to `~/.local/state/flar/omp/<project-slug>/`). On first use it seeds it with: this project's session transcripts (selected by the `cwd` each transcript self-attests, never by its bucket name), a fork of `history.db` containing only rows whose `cwd` matches — with the FTS index rebuilt so deleted prompts no longer match — and a fork of `agent.db` scoped to `-omp-model`'s provider (see [Credentials](#credentials)). The host's `config.yml`/`models.yml` are copied in, while `.env` files and terminal-session breadcrumbs are deliberately left out, and the compiled native addons are bind-mounted read-only from the host. The whole shadow home is then bind-mounted as `~/.omp/agent`, so new sessions persist there and `omp -c` / `--resume` sees only this project's sessions.
+
 Consequences to be aware of:
 
 * **Copilot CLI**: as with `agy`, the scoped shadow home becomes a separate per-project world after the initial seed. Sessions you start with Copilot **outside** `flar` are not pulled into `flar` later, and sessions you start **inside** `flar` are saved back to the scoped shadow home rather than the host's global Copilot store.
@@ -180,8 +196,8 @@ Consequences to be aware of:
 * Codex follows the same rule: after the one-time seed, wrapped and unwrapped Codex histories are independent.
 * Kimi Code likewise: after the one-time seed, wrapped and unwrapped Kimi histories are independent. Host-side changes to `config.toml` are not picked up after the seed either — delete the project's shadow home under `$XDG_STATE_HOME/flar/kimi/` to re-seed. (Credentials are the exception: they are live-bound, so `kimi login` and token refreshes on either side are seen by both.)
 * Pool follows the same rule: after the one-time seed, wrapped and unwrapped Pool histories are independent. Delete the project's shadow home under `$XDG_STATE_HOME/flar/pool/` to re-seed.
-* A conversation that `agy`'s own indices never attributed to the current workspace is not seeded, by design. The safe default is to withhold it rather than risk exposing another project's data.
-* Agent-owned `.flar/` directories are excluded from config copies for compatibility, and flar-owned state lives under `$XDG_STATE_HOME/flar/` (or `~/.local/state/flar/`), outside agent-managed configuration directories.
+* OMP follows the same rule: after the one-time seed, wrapped and unwrapped OMP histories are independent, and a session started outside flar will not appear in it later. Host-side changes to `config.yml`/`models.yml` or new credentials in `agent.db` are not picked up after the seed — delete the project's shadow home under `$XDG_STATE_HOME/flar/omp/` to re-seed (deleting it also drops sessions created only inside the sandbox).
+* The `-omp-model` scoping is applied at seed time. Changing it later does not rewrite an already-seeded `agent.db`; delete the project's shadow home to re-scope credentials.
 
 ## Network Security & Local Ports
 

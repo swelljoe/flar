@@ -212,6 +212,34 @@ func PrepareConfigDir(agent Agent, absProjectDir string) (string, error) {
 				return "", err
 			}
 		}
+
+	case AgentOmp:
+		// omp's agent home (~/.omp/agent) holds config.yml, models.yml, the
+		// session transcripts, and two global SQLite databases (history.db,
+		// agent.db). Only the YAML config files are copied here; they contain
+		// model roles and provider definitions but no credentials. The
+		// databases mix every project's data and are replaced at run time by
+		// a per-project shadow store (see prepareOmpStore), which merges this
+		// temp copy on first seed. .env files, if present, are deliberately
+		// not copied: they are a flat dump of every provider's key and would
+		// defeat the -omp-model credential scoping.
+		srcOmp := filepath.Join(home, ".omp", "agent")
+		if _, err := os.Stat(srcOmp); err == nil {
+			destOmp := filepath.Join(tempDir, "omp-config")
+			if err := os.MkdirAll(destOmp, 0o700); err != nil {
+				return "", err
+			}
+			for _, name := range []string{"config.yml", "models.yml"} {
+				srcFile := filepath.Join(srcOmp, name)
+				if _, err := os.Stat(srcFile); err != nil {
+					continue
+				}
+				if err := CopyFile(srcFile, filepath.Join(destOmp, name)); err != nil {
+					os.RemoveAll(tempDir)
+					return "", err
+				}
+			}
+		}
 	}
 
 	return tempDir, nil
