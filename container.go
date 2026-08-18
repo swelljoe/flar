@@ -28,6 +28,7 @@ const (
 	AgentPool     Agent = "pool"
 	AgentQwen     Agent = "qwen"
 	AgentMimo     Agent = "mimo"
+	AgentOmp      Agent = "omp"
 )
 
 // commonEnvVars is the set of non-secret host environment variables that flar
@@ -103,6 +104,11 @@ type RunOpts struct {
 	AskMode    bool
 	Verbose    bool
 	ExtraArgs  []string
+	// OmpModel optionally pins omp to a single "<provider>/<model>" (e.g.
+	// "anthropic/claude-sonnet"). When set, flar narrows the shadow agent.db to that
+	// provider's credentials and forwards only that provider's env vars, so one user
+	// with many model-provider keys need not expose them all to a single run.
+	OmpModel string
 	// ContainerCache persists images and layers built or pulled by podman
 	// inside the sandbox under flar's own cache dir (see containerCacheDir).
 	// When false, container storage lives on the sandbox's ephemeral tmpfs
@@ -533,6 +539,8 @@ func RunSandbox(opts RunOpts) (int, error) {
 		agentCmd = "qwen"
 	case AgentMimo:
 		agentCmd = "mimo"
+	case AgentOmp:
+		agentCmd = "omp"
 	default:
 		return 0, fmt.Errorf("unknown or unsupported agent: %s", opts.Agent)
 	}
@@ -578,6 +586,13 @@ func RunSandbox(opts RunOpts) (int, error) {
 				if _, statErr := os.Stat(defaultPath); statErr == nil {
 					hostAgentPath = defaultPath
 				}
+			}
+		}
+		// Fallback for omp's default install location (~/.local/bin/omp)
+		if opts.Agent == AgentOmp && hostAgentPath == "" {
+			defaultPath := filepath.Join(hostHome, ".local", "bin", "omp")
+			if _, err := os.Stat(defaultPath); err == nil {
+				hostAgentPath = defaultPath
 			}
 		}
 		if hostAgentPath == "" {
@@ -887,6 +902,29 @@ func RunSandbox(opts RunOpts) (int, error) {
 					bwrapArgs = append(bwrapArgs, "--bind", hostProjMem, hostProjMem)
 				}
 			}
+		case AgentOmp:
+			// omp keeps centralized state (history.db, agent.db) and per-project
+			// sessions under ~/.omp/agent. flar binds a project-scoped shadow store
+			// over it so other projects' history and credentials stay invisible
+			// (see prepareOmpStore). sessions/ is skipped from the static copy; only
+			// this project's session dir is live-bound below so transcripts persist
+			// and can be resumed without leaking other projects'.
+			store, err := prepareOmpStore(hostHome, absProjectDir, opts.OmpModel)
+			if err != nil {
+				return 0, fmt.Errorf("prepare omp store: %w", err)
+			}
+			ompAgent := filepath.Join(hostHome, ".omp", "agent")
+			bwrapArgs = append(bwrapArgs, "--bind", store, ompAgent)
+
+			// Live-bind only THIS project's session directory from the host (over the
+			// shadow's empty sessions root), matching omp's own on-disk slug so
+			// existing transcripts are picked up for resume.
+			if slug := encodeOmpSessionSlug(absProjectDir); slug != "" {
+				hostSess := filepath.Join(ompAgent, "sessions", slug)
+				if err := os.MkdirAll(hostSess, 0o700); err == nil {
+					bwrapArgs = append(bwrapArgs, "--bind", hostSess, hostSess)
+				}
+			}
 		}
 
 		// Git config
@@ -968,6 +1006,18 @@ func RunSandbox(opts RunOpts) (int, error) {
 		}
 	}
 
+	// When a model is pinned for omp, forward only that provider's credential env
+	// vars (matching the narrowed shadow agent.db). Without a pin none are forwarded:
+	// omp authenticates from agent.db and blanket-forwarding every host *_API_KEY
+	// would defeat the narrowing.
+	if opts.Agent == AgentOmp && opts.OmpModel != "" {
+		for _, env := range ompAgentEnvVars(opts.OmpModel) {
+			if val, exists := os.LookupEnv(env); exists {
+				bwrapArgs = append(bwrapArgs, "--setenv", env, val)
+			}
+		}
+	}
+
 	// Point agy at the private Secret Service and tell the internal service
 	// where to read the token from.
 	if agySecretInSandbox != "" {
@@ -1045,6 +1095,17 @@ func RunSandbox(opts RunOpts) (int, error) {
 		// mimo needs --trust to skip the workspace trust prompt inside the
 		// sandbox, since the project directory is bind-mounted.
 		agentArgs = append(agentArgs, "--trust")
+	case AgentOmp:
+		// Use the resolved host path: omp is installed outside /usr (~/.local/bin)
+		// but bind-mounted at exactly this location inside the sandbox by the generic
+		// agent-binary mount.
+		agentArgs = append(agentArgs, hostAgentPath)
+		if opts.OmpModel != "" {
+			agentArgs = append(agentArgs, "--model", opts.OmpModel)
+		}
+		if !opts.AskMode {
+			agentArgs = append(agentArgs, "--auto-approve")
+		}
 	}
 
 	if len(opts.ExtraArgs) > 0 {

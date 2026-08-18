@@ -212,6 +212,12 @@ func PrepareConfigDir(agent Agent, absProjectDir string) (string, error) {
 				return "", err
 			}
 		}
+	case AgentOmp:
+		// No static overlay to stage: all of omp's state (config, history, credentials,
+		// sessions) lives in ~/.omp/agent and is supplied at run time by prepareOmpStore,
+		// which seeds a per-project shadow store directly from the host and mounts it over
+		// that directory. The temp dir merely needs to exist (non-empty) so RunSandbox's
+		// `if opts.TempConfig != ""` gate triggers the run-time bind.
 	}
 
 	return tempDir, nil
