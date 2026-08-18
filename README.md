@@ -64,12 +64,13 @@ flar [flags] [path/to/project] [extra agent args/prompts...]
 
 ### Flags
 
-- `-m`: Specify the agent to run (`claude`, `codex`, `agy`, `copilot`, `reasonix`, `kimi`, `pool`, `qwen`). Defaults to checking available host configurations or environment variables.
+- `-m`: Specify the agent to run (`claude`, `codex`, `agy`, `copilot`, `reasonix`, `kimi`, `pool`, `qwen`, `mimo`, `omp`). Defaults to checking available host configurations or environment variables.
 - `-ask`: Do not skip permissions/approvals (forcing the agent to ask for permission).
 - `-network`: Network mode: `isolated` (default) or `host`.
 - `-allow-port`: Allow a specific local TCP port (e.g. `8080`, `11434`) through the isolated network sandbox. Can be specified multiple times.
 - `-container-cache`: Persist container images built or pulled by podman inside the sandbox under `~/.cache/flar/containers` (respecting `XDG_CACHE_HOME`). Without it, container storage is ephemeral and discarded on exit. See [Container builds (podman)](#container-builds-podman).
 - `-v`: Enable verbose logging.
+- `-omp-model`: For `omp` only — pin omp to a single `<provider>/<model>` (e.g. `anthropic/claude-sonnet`). This narrows the sandbox's credential store and forwarded env vars to just that provider, so a user with keys for many model providers need not expose all of them to one run (see [Credentials](#credentials)). Ignored with a warning if the agent is not omp.
 
 ### Configuration file (`.flar.json`)
 
@@ -96,6 +97,7 @@ Because only a temporary copy of your config is mounted, agents run authenticate
 * **Kimi Code**: `~/.kimi-code/` — `config.toml`, `tui.toml`, and `device_id`. Kimi stores credentials in files (`storage = "file"`), so no keyring bridge is needed. Unlike the other agents, the credential dirs (`credentials/`, `oauth/`) are **live-bound from the host** rather than copied into flar's persistent shadow home: Kimi's access tokens live only ~15 minutes and the refresh token rotates on every use, so a copied token goes stale almost immediately, and a sandbox-side refresh of a copied token would invalidate the host's login (and vice versa). Live-binding means `kimi login` on the host is picked up immediately, at the cost of the sandbox being able to write to Kimi's own credential files (which hold only its OAuth tokens, readable by an authenticated agent anyway). The `bin/` (the `kimi` executable itself) and `updates/` directories are not copied; the real binary is bind-mounted read-only at run time.
 * **Poolside (`pool`)**: `~/.config/poolside/` — `credentials.json`, `settings.yaml`, and `skills/`. Pool stores API keys in `credentials.json` (and also honors the `POOLSIDE_API_KEY` environment variable), so no keyring bridge is needed. The config is copied to a temporary directory; the state directory (`~/.local/state/poolside/`) is forked per-project (see below).
 * **Qwen Code**: `~/.qwen/` — `settings.json` (which holds API keys under its `env` key), `output-language.md`, `extensions/`, `skills/`, `memories/`, and `installation_id`. Qwen also honors the `DASHSCOPE_API_KEY`, `BAILIAN_CODING_PLAN_API_KEY`, and `BAILIAN_TOKEN_PLAN_API_KEY` environment variables. No keyring bridge is needed.
+* **omp**: `~/.omp/agent/` — `config.yml`, `models.yml`, and the centralized auth store `agent.db`. Unlike the file-based agents, omp keeps *every* provider's API key in one SQLite database (`auth_credentials`), so binding it unfiltered would hand a prompt injection every model-provider key you own. `flar` always seeds a per-project shadow of this directory (see [Session persistence & resume](#session-persistence--resume)); by default the whole credential set is snapshotted into it, but with `-omp-model <provider>/<model>` only that provider's credentials are kept and only its env var(s) (e.g. `ANTHROPIC_API_KEY`) are forwarded into the sandbox. If you leave `-omp-model` unset, assume every API key in `agent.db` is reachable inside the sandbox — restrict it if your account spans multiple model providers.
 
 ### Antigravity (`agy`) keyring
 
@@ -146,6 +148,16 @@ The first time `flar` runs `agy` in a project, it seeds that project's scoped st
 * **Reasonix**: Just like Claude Code. Reasonix keeps each project history in its own subdirectory directory, so it can be bindmounted in the same way as Claude Code, with the same caveat.
 
 * **Qwen Code**: Just like Claude Code and Reasonix. Qwen keeps each project's sessions in its own subdirectory (`~/.qwen/projects/<project-slug>/chats/`), so it can be bind-mounted in the same way, with the same caveat. The project slug uses the same encoding as Claude — replacing every non-alphanumeric character with `-`.
+
+* **omp**: omp splits its state in `~/.omp/agent/` two ways, and flar handles each accordingly. Sessions (transcripts) already live per-project at `~/.omp/agent/sessions/<slug>/`, where `<slug>` encodes the project path relative to `$HOME` with every `/`→`-` (e.g. `/home/joe/src/flar` → `-src-flar`). flar binds only this project's session directory from the host over a per-project shadow store, so `--continue`/resume sees this project's conversations and nothing else — the same mechanism as Claude Code, with the same caveat about resuming a poisoned session.
+
+The centralized prompt history is different: it lives in one global SQLite database (`history.db`) whose rows mix every project and whose picker is not filtered by the current directory, so binding it directly would leak other projects' prompts. flar gives each workspace its own **shadow agent directory** instead:
+
+```
+$XDG_STATE_HOME/flar/omp/<project-slug>/
+```
+
+(falling back to `~/.local/state/flar/omp/<project-slug>/`). On first use it copies the static config (`config.yml`, `models.yml`) and forks `history.db` down to just this project's rows — the FTS5 index is rebuilt to match — then mounts the whole shadow as `~/.omp/agent` with this project's session directory live-bound over it. New sessions persist there and can be resumed; other projects' history and credentials stay out of the sandbox. As with the forked agents, after the one-time seed wrapped and unwrapped omp state are independent — delete the project's shadow under `$XDG_STATE_HOME/flar/omp/` to re-seed.
 
 * **Kimi Code**: as with Codex and Copilot, sessions are "forked" on first run in a project by `flar`, and are no longer shared with `kimi` running outside of `flar`.
 

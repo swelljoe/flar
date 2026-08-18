@@ -64,11 +64,13 @@ func main() {
 	}
 
 	// 1. Define command-line flags
-	agentFlag := flag.String("m", "", "Specify the agent to run (claude, codex, agy, copilot, reasonix, kimi, pool, qwen, mimo)")
+	agentFlag := flag.String("m", "", "Specify the agent to run (claude, codex, agy, copilot, reasonix, kimi, pool, qwen, mimo, omp)")
 	askFlag := flag.Bool("ask", false, "Disable bypass of agent permissions/approvals (ask for permission)")
 	networkFlag := flag.String("network", "", "Network mode: isolated (default) or host")
 	containerCacheFlag := flag.Bool("container-cache", false, "Persist container images built or pulled by podman inside the sandbox under ~/.cache/flar/containers (default: ephemeral, discarded on exit)")
 	verboseFlag := flag.Bool("v", false, "Enable verbose logging")
+
+	ompModelFlag := flag.String("omp-model", "", "For -m omp only: pin omp to a single \"<provider>/<model>\" (e.g. anthropic/claude-sonnet). Narrows the sandbox's credential store and env vars to just that provider so one user with many model-provider keys need not expose them all.")
 
 	var allowPortsFlag intSlice
 	flag.Var(&allowPortsFlag, "allow-port", "Allow a specific local TCP port through the network sandbox (can specify multiple)")
@@ -118,7 +120,7 @@ func main() {
 
 	// Validate agent
 	switch selectedAgent {
-	case AgentClaude, AgentCodex, AgentAgy, AgentCopilot, AgentReasonix, AgentKimi, AgentPool, AgentQwen, AgentMimo:
+	case AgentClaude, AgentCodex, AgentAgy, AgentCopilot, AgentReasonix, AgentKimi, AgentPool, AgentQwen, AgentMimo, AgentOmp:
 		// Valid
 	default:
 		fmt.Fprintf(os.Stderr, "Error: Unknown or unsupported agent: %s\n", selectedAgent)
@@ -147,6 +149,10 @@ func main() {
 	if networkMode != "isolated" && networkMode != "host" {
 		fmt.Fprintf(os.Stderr, "Error: Unknown network mode: %s (must be 'isolated' or 'host')\n", networkMode)
 		os.Exit(1)
+	}
+
+	if *ompModelFlag != "" && selectedAgent != AgentOmp {
+		fmt.Fprintf(os.Stderr, "Warning: -omp-model is ignored unless the agent is omp.\n")
 	}
 
 	// Merge allowed ports from config and CLI flags
@@ -237,6 +243,7 @@ func main() {
 		Verbose:        *verboseFlag,
 		ExtraArgs:      agentArgs,
 		ContainerCache: containerCache,
+		OmpModel:       *ompModelFlag,
 	})
 
 	// 7. Tear down host-side state before exiting: the os.Exit calls below
@@ -396,6 +403,11 @@ func autoDetectAgent() Agent {
 		}
 		if _, exists := os.LookupEnv("XIAOMI_API_KEY"); exists {
 			return AgentMimo
+		}
+
+		// Check 10. Omp
+		if fileExists(filepath.Join(home, ".omp")) {
+			return AgentOmp
 		}
 	}
 
