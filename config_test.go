@@ -60,3 +60,117 @@ func TestCopyFileAndDir(t *testing.T) {
 		t.Errorf("copied file2 content mismatch: got %q, want %q", gotFile2, file2Content)
 	}
 }
+
+func TestCopyDirPreservesSymlinks(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+
+	// 1. Regular file
+	origFile := filepath.Join(src, "real.txt")
+	if err := os.WriteFile(origFile, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Relative file symlink
+	relLink := filepath.Join(src, "link-rel.txt")
+	if err := os.Symlink("real.txt", relLink); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Absolute file symlink
+	absLink := filepath.Join(src, "link-abs.txt")
+	if err := os.Symlink(origFile, absLink); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4. Directory symlink (pointing to external skills directory)
+	externalDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(externalDir, "SKILL.md"), []byte("# Skill"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dirLink := filepath.Join(src, "my-skill")
+	if err := os.Symlink(externalDir, dirLink); err != nil {
+		t.Fatal(err)
+	}
+
+	copied := filepath.Join(dst, "copied")
+	if err := CopyDir(src, copied); err != nil {
+		t.Fatalf("CopyDir failed: %v", err)
+	}
+
+	// Verify relative link
+	target, err := os.Readlink(filepath.Join(copied, "link-rel.txt"))
+	if err != nil {
+		t.Fatalf("failed to readlink rel: %v", err)
+	}
+	if target != "real.txt" {
+		t.Errorf("rel link target = %q, want %q", target, "real.txt")
+	}
+
+	// Verify absolute link
+	target, err = os.Readlink(filepath.Join(copied, "link-abs.txt"))
+	if err != nil {
+		t.Fatalf("failed to readlink abs: %v", err)
+	}
+	if target != origFile {
+		t.Errorf("abs link target = %q, want %q", target, origFile)
+	}
+
+	// Verify directory symlink
+	target, err = os.Readlink(filepath.Join(copied, "my-skill"))
+	if err != nil {
+		t.Fatalf("failed to readlink dir link: %v", err)
+	}
+	if target != externalDir {
+		t.Errorf("dir link target = %q, want %q", target, externalDir)
+	}
+}
+
+func TestCopyDirExceptPreservesSymlinks(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+
+	skillsDir := filepath.Join(src, "config", "skills")
+	if err := os.MkdirAll(skillsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	externalSkill := "/opt/skills/cool-skill"
+	if err := os.Symlink(externalSkill, filepath.Join(skillsDir, "cool-skill")); err != nil {
+		t.Fatal(err)
+	}
+
+	copied := filepath.Join(dst, "copied")
+	if err := CopyDirExcept(src, copied, map[string]bool{}); err != nil {
+		t.Fatalf("CopyDirExcept failed: %v", err)
+	}
+
+	target, err := os.Readlink(filepath.Join(copied, "config", "skills", "cool-skill"))
+	if err != nil {
+		t.Fatalf("failed to readlink: %v", err)
+	}
+	if target != externalSkill {
+		t.Errorf("symlink target = %q, want %q", target, externalSkill)
+	}
+}
+
+func TestCopyClaudeConfigPreservesSymlinks(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+
+	externalSkills := t.TempDir()
+	if err := os.Symlink(externalSkills, filepath.Join(src, "skills")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := copyClaudeConfig(src, dst, "/workspace"); err != nil {
+		t.Fatalf("copyClaudeConfig failed: %v", err)
+	}
+
+	target, err := os.Readlink(filepath.Join(dst, "skills"))
+	if err != nil {
+		t.Fatalf("failed to readlink: %v", err)
+	}
+	if target != externalSkills {
+		t.Errorf("claude skills symlink target = %q, want %q", target, externalSkills)
+	}
+}

@@ -248,16 +248,24 @@ func copyClaudeConfig(src, dst, absProjectDir string) error {
 	}
 	for _, name := range claudeConfigAllowlist {
 		srcPath := filepath.Join(src, name)
-		info, err := os.Stat(srcPath)
+		lstatInfo, err := os.Lstat(srcPath)
 		if err != nil {
 			continue // absent entries are fine
 		}
 		dstPath := filepath.Join(dst, name)
-		if info.IsDir() {
+		if lstatInfo.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(srcPath)
+			if err != nil {
+				return err
+			}
+			if err := os.Symlink(target, dstPath); err != nil {
+				return err
+			}
+		} else if lstatInfo.IsDir() {
 			if err := CopyDir(srcPath, dstPath); err != nil {
 				return err
 			}
-		} else if info.Mode().IsRegular() {
+		} else if lstatInfo.Mode().IsRegular() {
 			if err := CopyFile(srcPath, dstPath); err != nil {
 				return err
 			}
@@ -415,7 +423,16 @@ func copyDirRel(src, dst, rel string, skip map[string]bool) error {
 			continue
 		}
 		srcPath := filepath.Join(src, childRel)
-		if entry.IsDir() {
+		dstPath := filepath.Join(dst, childRel)
+		if entry.Type()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(srcPath)
+			if err != nil {
+				return err
+			}
+			if err := os.Symlink(target, dstPath); err != nil {
+				return err
+			}
+		} else if entry.IsDir() {
 			if err := copyDirRel(src, dst, childRel, skip); err != nil {
 				return err
 			}
@@ -425,7 +442,7 @@ func copyDirRel(src, dst, rel string, skip map[string]bool) error {
 				return err
 			}
 			if fi.Mode().IsRegular() {
-				if err := CopyFile(srcPath, filepath.Join(dst, childRel)); err != nil {
+				if err := CopyFile(srcPath, dstPath); err != nil {
 					return err
 				}
 			}
@@ -454,12 +471,19 @@ func CopyDir(src, dst string) error {
 		srcPath := filepath.Join(src, entry.Name())
 		dstPath := filepath.Join(dst, entry.Name())
 
-		if entry.IsDir() {
+		if entry.Type()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(srcPath)
+			if err != nil {
+				return err
+			}
+			if err := os.Symlink(target, dstPath); err != nil {
+				return err
+			}
+		} else if entry.IsDir() {
 			if err := CopyDir(srcPath, dstPath); err != nil {
 				return err
 			}
 		} else {
-			// Skip symlinks or non-regular files
 			info, err := entry.Info()
 			if err != nil {
 				return err
