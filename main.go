@@ -6,15 +6,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Config represents the settings read from a config file.
 type Config struct {
-	Agent          string `json:"agent"`
-	Ask            bool   `json:"ask"`
-	AllowPorts     []int  `json:"allow_ports"`
-	Network        string `json:"network"`
-	ContainerCache bool   `json:"container_cache"`
+	Agent          string   `json:"agent"`
+	Ask            bool     `json:"ask"`
+	AllowPorts     []int    `json:"allow_ports"`
+	Network        string   `json:"network"`
+	ContainerCache bool     `json:"container_cache"`
+	RoBind         []string `json:"ro_bind"`
 }
 
 type intSlice []int
@@ -29,6 +31,22 @@ func (i *intSlice) Set(value string) error {
 		return err
 	}
 	*i = append(*i, val)
+	return nil
+}
+
+type stringSlice []string
+
+func (s *stringSlice) String() string {
+	return strings.Join(*s, ", ")
+}
+
+func (s *stringSlice) Set(value string) error {
+	for _, p := range strings.Split(value, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			*s = append(*s, p)
+		}
+	}
 	return nil
 }
 
@@ -72,6 +90,11 @@ func main() {
 
 	var allowPortsFlag intSlice
 	flag.Var(&allowPortsFlag, "allow-port", "Allow a specific local TCP port through the network sandbox (can specify multiple)")
+
+	var roBindFlag stringSlice
+	flag.Var(&roBindFlag, "ro-bind", "Bind mount a host directory or file read-only into the sandbox (path or src:dest, can specify multiple)")
+	flag.Var(&roBindFlag, "bind-ro", "Alias for -ro-bind")
+	flag.Var(&roBindFlag, "ro-dir", "Alias for -ro-bind")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: flar [flags] [path/to/project] [extra agent args/prompts...]\n\n")
@@ -165,6 +188,28 @@ func main() {
 		}
 	}
 
+	// Merge read-only bind mounts from global config and CLI flags
+	var roBindList []string
+	roBindSeen := make(map[string]bool)
+	for _, b := range config.RoBind {
+		if !roBindSeen[b] {
+			roBindSeen[b] = true
+			roBindList = append(roBindList, b)
+		}
+	}
+	for _, b := range roBindFlag {
+		if !roBindSeen[b] {
+			roBindSeen[b] = true
+			roBindList = append(roBindList, b)
+		}
+	}
+
+	bindMounts, err := parseBindMounts(roBindList)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
 	if *verboseFlag {
 		fmt.Printf("Workspace: %s\n", absProjectDir)
 		fmt.Printf("Detected/Selected Agent: %s\n", selectedAgent)
@@ -172,6 +217,12 @@ func main() {
 		fmt.Printf("Network Mode: %s\n", networkMode)
 		if len(allowPorts) > 0 {
 			fmt.Printf("Allowed Local Ports: %v\n", allowPorts)
+		}
+		if len(bindMounts) > 0 {
+			fmt.Printf("Read-Only Bind Mounts:\n")
+			for _, m := range bindMounts {
+				fmt.Printf("  %s -> %s\n", m.HostPath, m.SandboxPath)
+			}
 		}
 		if containerCache {
 			cacheDir := "~/.cache/flar/containers"
@@ -237,6 +288,7 @@ func main() {
 		Verbose:        *verboseFlag,
 		ExtraArgs:      agentArgs,
 		ContainerCache: containerCache,
+		BindMounts:     bindMounts,
 	})
 
 	// 7. Tear down host-side state before exiting: the os.Exit calls below
@@ -268,7 +320,7 @@ func main() {
 // on host networking, open local ports, or add host directories the sandbox
 // may write to, for anyone who clones the repo and runs flar in it — exactly
 // the supply-chain scenario flar exists to contain. "network", "allow_ports",
-// and "container_cache" are therefore honored only from the user-level global
+// "container_cache", and "ro_bind" are therefore honored only from the user-level global
 // config (or the command line); "agent" and "ask" are safe to take from the
 // project config because they cannot reduce isolation.
 func loadConfig(projectDir string) Config {
@@ -288,6 +340,9 @@ func loadConfig(projectDir string) Config {
 			if local.ContainerCache {
 				fmt.Fprintf(os.Stderr, "Warning: ignoring container_cache in %s: the container cache can only be enabled from the global config or with -container-cache\n", localPath)
 			}
+			if len(local.RoBind) > 0 {
+				fmt.Fprintf(os.Stderr, "Warning: ignoring ro_bind in %s: read-only bind mounts can only be configured in the global config or with -ro-bind\n", localPath)
+			}
 			return Config{Agent: local.Agent, Ask: local.Ask}
 		}
 	}
@@ -302,6 +357,74 @@ func loadConfig(projectDir string) Config {
 	}
 
 	return config
+}
+
+// expandHome expands a leading ~ or ~/ to the user's home directory.
+func expandHome(path string) string {
+	if path == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			return home
+		}
+	} else if strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, path[2:])
+		}
+	}
+	return path
+}
+
+// parseBindMounts parses and validates read-only bind mount specifications.
+// Accepts "SRC" (where sandbox destination defaults to SRC) or "SRC:DEST".
+func parseBindMounts(specs []string) ([]BindMount, error) {
+	var mounts []BindMount
+	seen := make(map[string]bool)
+
+	for _, spec := range specs {
+		spec = strings.TrimSpace(spec)
+		if spec == "" {
+			continue
+		}
+
+		var hostPart, sandboxPart string
+		if idx := strings.Index(spec, ":"); idx != -1 {
+			hostPart = spec[:idx]
+			sandboxPart = spec[idx+1:]
+		} else {
+			hostPart = spec
+			sandboxPart = ""
+		}
+
+		hostPart = expandHome(hostPart)
+		absHost, err := filepath.Abs(hostPart)
+		if err != nil {
+			return nil, fmt.Errorf("resolving host path %q: %w", hostPart, err)
+		}
+		absHost = filepath.Clean(absHost)
+
+		if _, err := os.Stat(absHost); err != nil {
+			return nil, fmt.Errorf("read-only bind source path does not exist: %s", absHost)
+		}
+
+		if sandboxPart == "" {
+			sandboxPart = absHost
+		} else {
+			sandboxPart = expandHome(sandboxPart)
+			if !filepath.IsAbs(sandboxPart) {
+				sandboxPart = "/" + sandboxPart
+			}
+			sandboxPart = filepath.Clean(sandboxPart)
+		}
+
+		key := absHost + "->" + sandboxPart
+		if !seen[key] {
+			seen[key] = true
+			mounts = append(mounts, BindMount{
+				HostPath:    absHost,
+				SandboxPath: sandboxPart,
+			})
+		}
+	}
+	return mounts, nil
 }
 
 func fileExists(path string) bool {

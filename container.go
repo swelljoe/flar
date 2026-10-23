@@ -92,6 +92,13 @@ func ensureFile(path string) bool {
 	return true
 }
 
+// BindMount represents an additional host directory or file to mount read-only
+// into the sandbox.
+type BindMount struct {
+	HostPath    string
+	SandboxPath string
+}
+
 // RunOpts holds parameters for running the Bubblewrap sandbox.
 type RunOpts struct {
 	ProjectDir string
@@ -108,6 +115,7 @@ type RunOpts struct {
 	// When false, container storage lives on the sandbox's ephemeral tmpfs
 	// and is discarded on exit.
 	ContainerCache bool
+	BindMounts     []BindMount
 }
 
 // containerCacheDir returns the host directory where flar persists container
@@ -954,6 +962,20 @@ func RunSandbox(opts RunOpts) (int, error) {
 		}
 	}
 
+	// Mount user-specified read-only bind mounts (e.g. external skills)
+	for _, m := range opts.BindMounts {
+		realSrc, err := filepath.EvalSymlinks(m.HostPath)
+		if err != nil {
+			realSrc = m.HostPath
+		}
+		bwrapArgs = append(bwrapArgs, ensureBwrapDirs(m.SandboxPath)...)
+		bwrapArgs = append(bwrapArgs, "--ro-bind", realSrc, m.SandboxPath)
+		if realSrc != m.HostPath && m.SandboxPath == m.HostPath {
+			bwrapArgs = append(bwrapArgs, ensureBwrapDirs(realSrc)...)
+			bwrapArgs = append(bwrapArgs, "--ro-bind-try", realSrc, realSrc)
+		}
+	}
+
 	// Mount local network proxy directory if isolated network
 	if opts.Network == "isolated" && opts.TempNetDir != "" {
 		bwrapArgs = append(bwrapArgs, "--bind", opts.TempNetDir, "/run/flar-net")
@@ -1272,4 +1294,20 @@ func redactedArgs(args []string) []string {
 		}
 	}
 	return out
+}
+
+// ensureBwrapDirs returns the --dir arguments needed to create every ancestor
+// directory of target so bwrap can mount onto target without ENOENT.
+func ensureBwrapDirs(target string) []string {
+	var args []string
+	dir := filepath.Dir(target)
+	curr := "/"
+	for _, part := range strings.Split(dir, "/") {
+		if part == "" {
+			continue
+		}
+		curr = filepath.Join(curr, part)
+		args = append(args, "--dir", curr)
+	}
+	return args
 }

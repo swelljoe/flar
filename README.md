@@ -24,6 +24,7 @@ Bubblewrap is extremely well-tested, and actively maintained. It is used by Flat
 - **Config Copying**: Automatically copies host credentials (like `~/.claude/`, `~/.codex/`, `~/.gemini/`, or GitHub CLI configurations) to a temporary directory mounted inside the sandbox home directory, leaving host config files untouched.
 - **Session Persistence & Resume**: When reasonably safe (currently Claude Code, Reasonix, and Qwen Code) conversations started inside a sandbox are written back to the host, so `--resume`/`--continue` works across runs — scoped to the current project so no other project's history enters the sandbox. Otherwise, history is forked on first run of `flar` for a given agent and project. See [Session persistence & resume](#session-persistence--resume).
 - **Keyring Bridging (`agy`)**: The Antigravity CLI stores its OAuth token in the OS keyring rather than a file. `flar` extracts only that one secret and serves it inside the sandbox through a private, in-process Secret Service — so the agent authenticates without exposing the rest of your keyring. See [Credentials](#credentials).
+- **Read-Only Bind Mounts & External Skills**: Mount additional host directories or files read-only into the sandbox via `-ro-bind` (or `ro_bind` in the global config). Configuration symlinks (e.g. skills symlinked into `~/.gemini/config/skills/` or `~/.claude/skills/` from external repositories) are preserved and resolved inside the sandbox without having to copy external trees into your global configuration. See [Read-only bind mounts & external skills](#read-only-bind-mounts--external-skills).
 - **Container Builds (podman)**: A wrapped agent can use rootless `podman`/`buildah` from the host's `/usr` to pull images, build images, and run containers inside the sandbox. Storage is ephemeral by default; `-container-cache` persists it under flar's own cache directory. See [Container builds (podman)](#container-builds-podman).
 
 ## Build and Install
@@ -68,6 +69,7 @@ flar [flags] [path/to/project] [extra agent args/prompts...]
 - `-ask`: Do not skip permissions/approvals (forcing the agent to ask for permission).
 - `-network`: Network mode: `isolated` (default) or `host`.
 - `-allow-port`: Allow a specific local TCP port (e.g. `8080`, `11434`) through the isolated network sandbox. Can be specified multiple times.
+- `-ro-bind`: Bind mount a host directory or file read-only into the sandbox. Can be specified multiple times or comma-separated. Supports `path` (mounts at the same absolute path inside the sandbox) or `src:dest`. Aliased as `-bind-ro` and `-ro-dir`. See [Read-only bind mounts & external skills](#read-only-bind-mounts--external-skills).
 - `-container-cache`: Persist container images built or pulled by podman inside the sandbox under `~/.cache/flar/containers` (respecting `XDG_CACHE_HOME`). Without it, container storage is ephemeral and discarded on exit. See [Container builds (podman)](#container-builds-podman).
 - `-v`: Enable verbose logging.
 
@@ -81,11 +83,12 @@ You can configure options per-project in `<project>/.flar.json` or globally in `
   "ask": false,
   "network": "isolated",
   "allow_ports": [5432, 11434],
-  "container_cache": false
+  "container_cache": false,
+  "ro_bind": ["/home/user/skills", "~/team-skills"]
 }
 ```
 
-A project-level `.flar.json` travels with the repository, so it cannot weaken sandbox isolation: `network`, `allow_ports`, and `container_cache` are honored **only** from the global config (or the `-network` / `-allow-port` / `-container-cache` flags) and are ignored — with a warning — when found in a project config. Otherwise a malicious repo could turn on host networking, open local ports, or add host directories the sandbox may write to, for anyone who clones it and runs `flar`. `agent` and `ask` are safe to set per-project.
+A project-level `.flar.json` travels with the repository, so it cannot weaken sandbox isolation: `network`, `allow_ports`, `container_cache`, and `ro_bind` are honored **only** from the global config (or the `-network` / `-allow-port` / `-container-cache` / `-ro-bind` flags) and are ignored — with a warning — when found in a project config. Otherwise a malicious repo could turn on host networking, open local ports, or add host directories the sandbox may read or write to, for anyone who clones it and runs `flar`. `agent` and `ask` are safe to set per-project.
 
 ## Credentials
 
@@ -190,6 +193,47 @@ In **isolated** network mode, the agent's environment has no direct access to ho
 * **Internet Access**: Works automatically for HTTP/HTTPS requests (such as connecting to cloud LLMs like Anthropic or Gemini) using the `HTTP_PROXY` and `HTTPS_PROXY` environment variables.
 * **Localhost Restrictions**: Requests to `localhost`, loopback, private, and link-local IPs via the proxy are blocked (this includes cloud instance metadata endpoints such as `169.254.169.254`).
 * **Exposing Local Services**: To let the agent reach a local database or local LLM (e.g. Ollama on `127.0.0.1:11434`), specify the port using `-allow-port 11434` or the `allow_ports` setting in the **global** config. A secure loopback forwarder will bind `127.0.0.1:11434` inside the sandbox and proxy traffic to the host.
+
+## Read-Only Bind Mounts & External Skills
+
+By default, `flar` hides host files outside your current workspace and necessary agent configuration. However, you may have shared skill repositories, team toolkits, or custom documentation directories that you want available inside the sandbox.
+
+In particular, AI coding agents like Antigravity (`agy`) and Claude Code support custom skills (e.g. `~/.gemini/config/skills/` or `~/.claude/skills/`). A common pattern is to symlink individual skills or an entire skills directory from an external git clone into your agent configuration:
+
+```bash
+# Example: symlink custom skills into your global agent configuration
+ln -s ~/proj/debian-ai/skills/debhelper-compat ~/.gemini/config/skills/debhelper-compat
+```
+
+Inside `flar`:
+1. `flar` preserves symlinks when preparing the temporary configuration directory for the sandbox.
+2. Passing `-ro-bind` makes the underlying target directory accessible read-only inside Bubblewrap:
+
+```bash
+# Mount external skills directory read-only
+flar -ro-bind ~/proj/debian-ai/skills
+
+# Mount multiple directories
+flar -ro-bind ~/proj/debian-ai/skills -ro-bind /opt/custom-tools
+
+# Or specify a custom destination inside the sandbox
+flar -ro-bind ~/proj/debian-ai/skills:/skills
+```
+
+### Global Configuration (`~/.config/flar/config.json`)
+
+To avoid having to specify `-ro-bind` on every run, add `ro_bind` to your user-level global configuration file:
+
+```json
+{
+  "ro_bind": [
+    "~/proj/debian-ai/skills",
+    "/opt/shared-tools"
+  ]
+}
+```
+
+Tilde expansion (`~` or `~/...`) is supported both on the command line and in the configuration file.
 
 ## Container builds (podman)
 

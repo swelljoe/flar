@@ -556,3 +556,20 @@ func TestPathCovered(t *testing.T) {
 		}
 	}
 }
+
+func TestEnsureBwrapDirs(t *testing.T) {
+	for _, tc := range []struct {
+		target string
+		want   []string
+	}{
+		{"/", nil},
+		{"/skills", nil},
+		{"/opt/skills", []string{"--dir", "/opt"}},
+		{"/home/user/proj/skills", []string{"--dir", "/home", "--dir", "/home/user", "--dir", "/home/user/proj"}},
+	} {
+		got := ensureBwrapDirs(tc.target)
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("ensureBwrapDirs(%q) = %v, want %v", tc.target, got, tc.want)
+		}
+	}
+}
